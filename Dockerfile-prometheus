@@ -1,0 +1,71 @@
+# Export Intel iGPU metrics to prometheus
+# Building:
+#   docker build -t intel-prometheus -f Dockerfile-prometheus .
+# Running:
+#  docker run --rm -it --device /dev/dri:/dev/dri --privileged -p 8080:8080 intel-prometheus
+# Querying metrics:
+#  curl http://localhost:8080/metrics
+
+FROM ubuntu:20.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update
+RUN apt-get install -y \
+    gcc \
+    flex \
+    bison \
+    pkg-config \
+    libatomic1 \
+    libpciaccess-dev \
+    libkmod-dev \
+    libprocps-dev \
+    libdw-dev \
+    zlib1g-dev \
+    liblzma-dev \
+    libcairo-dev \
+    libpixman-1-dev \
+    libudev-dev \
+    libxrandr-dev \
+    libxv-dev \
+    x11proto-dri2-dev \
+    meson \
+    libdrm-dev
+
+# just few extra dependencies for building IGT with all the optional components
+# enabled
+
+RUN apt-get install -y \
+    libunwind-dev \
+    libgsl-dev \
+    libasound2-dev \
+    libxmlrpc-core-c3-dev \
+    libjson-c-dev \
+    libcurl4-openssl-dev \
+    python-docutils \
+    valgrind \
+    peg \
+    libdrm-intel1
+
+# autotools build deps
+RUN apt-get install -y \
+    autoconf \
+    automake \
+    xutils-dev \
+    libtool \
+    make
+
+WORKDIR /code
+
+COPY . /code
+
+RUN ["meson", "build", "-D", "buildtype=release"]
+RUN ["ninja", "-C", "build"]
+
+FROM openresty/openresty:focal
+
+RUN sed -i 's/#user/user/g' /usr/local/openresty/nginx/conf/nginx.conf
+RUN sed -i 's/nobody/root/g' /usr/local/openresty/nginx/conf/nginx.conf
+
+COPY --from=0 /code/build/tools/intel_gpu_top /usr/bin/intel_gpu_top
+COPY openresty/default.conf /etc/nginx/conf.d/default.conf
