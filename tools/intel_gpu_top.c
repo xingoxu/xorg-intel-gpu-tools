@@ -659,6 +659,7 @@ usage(const char *appname)
 		"\t[-h]            Show this help text.\n"
 		"\t[-J]            Output JSON formatted data.\n"
 		"\t[-l]            List plain text data.\n"
+		"\t[-p]            Print in format of Prometheus metrics.\n"
 		"\t[-o <file|->]   Output to specified file or '-' for standard out.\n"
 		"\t[-s <ms>]       Refresh period in milliseconds (default %ums).\n"
 		"\t[-L]            List all cards.\n"
@@ -671,7 +672,8 @@ usage(const char *appname)
 static enum {
 	INTERACTIVE,
 	STDOUT,
-	JSON
+	JSON,
+	PROMETHEUS
 } output_mode;
 
 struct cnt_item {
@@ -846,6 +848,60 @@ term_close_struct(void)
 {
 }
 
+static void
+prometheus_open_struct(const char *name)
+{
+}
+
+static void
+prometheus_close_struct(void)
+{
+}
+
+
+
+static unsigned int
+prometheus_add_member(const struct cnt_group *parent, struct cnt_item *item,
+		  unsigned int headers)
+{
+	double val;
+	int len;
+	char parent_name_key[20];
+	char item_name_key[20];
+
+	if (!item->pmu)
+		return 0;
+	else if (!item->pmu->present)
+		return 0;
+	snprintf(parent_name_key, sizeof(parent_name_key), "%s", parent->name);
+	for (int i = 0; parent_name_key[i]; i++) {
+		parent_name_key[i] = tolower(parent_name_key[i]);
+		if (!(
+			(parent_name_key[i] >= '0' && parent_name_key[i] <= '9') ||
+			(parent_name_key[i] >= 'a' && parent_name_key[i] <= 'z')
+		)) {
+			parent_name_key[i] = '_';
+		}
+	}
+	snprintf(item_name_key, sizeof(item_name_key), "%s", item->name);
+	for (int i = 0; parent_name_key[i]; i++) {
+		item_name_key[i] = tolower(item_name_key[i]);
+	}
+
+	fprintf(out, "# HELP intel_gpu_top_%s_%s %s %s", parent_name_key, item_name_key, parent->display_name, item->name);
+	if (item->unit) {
+		fprintf(out, " (%s)", item->unit);
+	}
+	fprintf(out, "\n");
+	fprintf(out, "# TYPE intel_gpu_top_%s_%s gauge\n", parent_name_key, item_name_key);
+
+	val = pmu_calc(&item->pmu->val, item->d, item->t, item->s);
+
+	len = fprintf(out, "intel_gpu_top_%s_%s %f\n", parent_name_key, item_name_key, val);
+
+	return len > 0 ? len : 0;
+}
+
 static unsigned int
 term_add_member(const struct cnt_group *parent, struct cnt_item *item,
 		unsigned int headers)
@@ -920,6 +976,25 @@ print_group(struct cnt_group *grp, unsigned int headers)
 }
 
 static bool
+prometheus_print_group(struct cnt_group *grp, unsigned int headers)
+{
+	unsigned int consumed = 0;
+	struct cnt_item *item;
+
+	if (!present_in_group(grp))
+		return false;
+
+	pops->open_struct(grp->name);
+
+	for (item = grp->items; item->name; item++)
+		consumed += pops->add_member(grp, item, headers);
+
+	pops->close_struct();
+
+	return consumed;
+}
+
+static bool
 term_print_group(struct cnt_group *grp, unsigned int headers)
 {
 	unsigned int consumed = 0;
@@ -947,6 +1022,13 @@ static const struct print_operations stdout_pops = {
 	.close_struct = stdout_close_struct,
 	.add_member = stdout_add_member,
 	.print_group = print_group,
+};
+
+static const struct print_operations prometheus_pops = {
+	.open_struct = prometheus_open_struct,
+	.close_struct = prometheus_close_struct,
+	.add_member = prometheus_add_member,
+	.print_group = prometheus_print_group,
 };
 
 static const struct print_operations term_pops = {
@@ -1502,7 +1584,7 @@ int main(int argc, char **argv)
 	char *codename = NULL;
 
 	/* Parse options */
-	while ((ch = getopt(argc, argv, "o:s:d:JLlh")) != -1) {
+	while ((ch = getopt(argc, argv, "o:s:d:JLlph")) != -1) {
 		switch (ch) {
 		case 'o':
 			output_path = optarg;
@@ -1521,6 +1603,9 @@ int main(int argc, char **argv)
 			break;
 		case 'l':
 			output_mode = STDOUT;
+			break;
+		case 'p':
+			output_mode = PROMETHEUS;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -1562,6 +1647,9 @@ int main(int argc, char **argv)
 		break;
 	case STDOUT:
 		pops = &stdout_pops;
+		break;
+	case PROMETHEUS:
+		pops = &prometheus_pops;
 		break;
 	case JSON:
 		pops = &json_pops;
@@ -1647,6 +1735,10 @@ int main(int argc, char **argv)
 			}
 		}
 
+		/* Wait for data to arrive */
+		if (output_mode == PROMETHEUS)
+			usleep(period_us);
+
 		pmu_sample(engines);
 		t = (double)(engines->ts.cur - engines->ts.prev) / 1e9;
 
@@ -1665,6 +1757,11 @@ int main(int argc, char **argv)
 
 		if (stop_top)
 			break;
+
+		if (output_mode == PROMETHEUS) {
+			printf("\n");
+			break;
+		}
 
 		if (output_mode == INTERACTIVE)
 			process_stdin(period_us);
