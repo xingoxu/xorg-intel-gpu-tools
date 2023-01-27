@@ -5,7 +5,7 @@ on:
     branches: [ "prometheus" ]
 
 env:
-  REGISTRY_IMAGE: ghcr.io/xingoxu/intel-gpu-exporter
+  REGISTRY_IMAGE: ghcr.io/xingoxu/xorg-intel-gpu-tools
 
 jobs:
 
