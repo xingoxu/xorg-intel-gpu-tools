@@ -54,7 +54,12 @@ RUNTIME CONTROL
 Supported keys:
 
     'q'    Exit from the tool.
+    'h'    Show interactive help.
     '1'    Toggle between aggregated engine class and physical engine mode.
+    'n'    Toggle display of numeric client busyness overlay.
+    's'    Toggle between sort modes (runtime, total runtime, pid, client id).
+    'i'    Toggle display of clients which used no GPU time.
+    'H'    Toggle between per PID aggregation and individual clients.
 
 DEVICE SELECTION
 ================
@@ -76,6 +81,11 @@ Filter types: ::
     pci      pci:[vendor=%04x/name][,device=%04x][,card=%d]
              vendor is hex number or vendor name
 
+JSON OUTPUT
+===========
+
+To parse the JSON as output by the tool the consumer should wrap its entirety into square brackets ([ ]). This will make each sample point a JSON array element and will avoid "Multiple root elements" JSON validation error.
+
 LIMITATIONS
 ===========
 
@@ -86,4 +96,4 @@ LIMITATIONS
 REPORTING BUGS
 ==============
 
-Report bugs to https://bugs.freedesktop.org.
+Report bugs on fd.o GitLab: https://gitlab.freedesktop.org/drm/igt-gpu-tools/-/issues

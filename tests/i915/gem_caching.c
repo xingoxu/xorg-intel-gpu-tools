@@ -147,7 +147,8 @@ igt_main
 
 		igt_require_gem(data.fd);
 		gem_require_blitter(data.fd);
-		gem_require_caching(data.fd);
+		if (!gem_has_lmem(data.fd))
+			gem_require_caching(data.fd);
 
 		data.devid = intel_get_drm_devid(data.fd);
 		if (IS_GEN2(data.devid)) /* chipset only handles cached -> uncached */
@@ -158,12 +159,12 @@ igt_main
 			flags = 0;
 		}
 		data.bops = buf_ops_create(data.fd);
-		ibb = intel_bb_create(data.fd, PAGE_SIZE);
 
 		scratch_buf = intel_buf_create(data.bops, BO_SIZE/4, 1,
 					       32, 0, I915_TILING_NONE, 0);
 
-		gem_set_caching(data.fd, scratch_buf->handle, 1);
+		if (!gem_has_lmem(data.fd))
+			gem_set_caching(data.fd, scratch_buf->handle, 1);
 
 		staging_buf = intel_buf_create(data.bops, BO_SIZE/4, 1,
 					       32, 0, I915_TILING_NONE, 0);
@@ -173,6 +174,8 @@ igt_main
 		igt_require(flags & TEST_READ);
 
 		igt_info("checking partial reads\n");
+
+		ibb = intel_bb_create(data.fd, PAGE_SIZE);
 
 		for (i = 0; i < ROUNDS; i++) {
 			uint8_t val0 = i;
@@ -195,10 +198,14 @@ igt_main
 
 			igt_progress("partial reads test: ", i, ROUNDS);
 		}
+
+		intel_bb_destroy(ibb);
 	}
 
 	igt_subtest("writes") {
 		igt_require(flags & TEST_WRITE);
+
+		ibb = intel_bb_create(data.fd, PAGE_SIZE);
 
 		igt_info("checking partial writes\n");
 
@@ -240,10 +247,14 @@ igt_main
 
 			igt_progress("partial writes test: ", i, ROUNDS);
 		}
+
+		intel_bb_destroy(ibb);
 	}
 
 	igt_subtest("read-writes") {
 		igt_require((flags & TEST_BOTH) == TEST_BOTH);
+
+		ibb = intel_bb_create(data.fd, PAGE_SIZE);
 
 		igt_info("checking partial writes after partial reads\n");
 
@@ -307,10 +318,11 @@ igt_main
 
 			igt_progress("partial read/writes test: ", i, ROUNDS);
 		}
+
+		intel_bb_destroy(ibb);
 	}
 
 	igt_fixture {
-		intel_bb_destroy(ibb);
 		intel_buf_destroy(scratch_buf);
 		intel_buf_destroy(staging_buf);
 		buf_ops_destroy(data.bops);

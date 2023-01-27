@@ -21,65 +21,70 @@
  * IN THE SOFTWARE.
  */
 #include "igt.h"
-#include "igt_debugfs.h"
-#include "igt_aux.h"
-#include "igt_kmod.h"
-#include "igt_sysfs.h"
-#include "igt_core.h"
-
 #include <dirent.h>
 #include <sys/utsname.h>
+#ifdef __linux__
 #include <linux/limits.h>
+#endif
 #include <signal.h>
 #include <libgen.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 
-#define ENGINE_MASK  (I915_EXEC_RING_MASK | I915_EXEC_BSD_MASK)
+#include "i915/gem.h"
+#include "i915/gem_create.h"
+#include "igt_debugfs.h"
+#include "igt_aux.h"
+#include "igt_kmod.h"
+#include "igt_sysfs.h"
+#include "igt_core.h"
 
-static void store_dword(int fd, unsigned ring)
+#define BAR_SIZE_SHIFT 20
+#define MIN_BAR_SIZE 256
+
+IGT_TEST_DESCRIPTION("Tests the i915 module loading.");
+
+static void store_all(int i915)
 {
-	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
-	struct drm_i915_gem_exec_object2 obj[2];
-	struct drm_i915_gem_relocation_entry reloc;
-	struct drm_i915_gem_execbuffer2 execbuf;
+	const unsigned int gen = intel_gen(intel_get_drm_devid(i915));
+	uint32_t engines[I915_EXEC_RING_MASK + 1];
 	uint32_t batch[16];
+	uint64_t ahnd, offset, bb_offset;
+	unsigned int sz = ALIGN(sizeof(batch) * ARRAY_SIZE(engines), 4096);
+	struct drm_i915_gem_relocation_entry reloc = {
+		.offset = sizeof(uint32_t),
+		.read_domains = I915_GEM_DOMAIN_RENDER,
+		.write_domain = I915_GEM_DOMAIN_RENDER,
+	};
+	struct drm_i915_gem_exec_object2 obj[2] = {
+		{
+			.handle = gem_create(i915, sizeof(engines)),
+			.flags = EXEC_OBJECT_WRITE,
+		},
+		{
+			.handle = gem_create(i915, sz),
+			.relocation_count = 1,
+			.relocs_ptr = to_user_pointer(&reloc),
+		},
+	};
+	struct drm_i915_gem_execbuffer2 execbuf = {
+		.buffers_ptr = to_user_pointer(obj),
+		.buffer_count = 2,
+	};
+	const struct intel_execution_engine2 *e;
+	const intel_ctx_t *ctx;
+	int reloc_sz = sizeof(uint32_t);
+	unsigned int nengine, value;
+	void *cs;
 	int i;
-
-	if (!gem_has_ring(fd, ring))
-		return;
-
-	if (!gem_can_store_dword(fd, ring))
-		return;
-
-	intel_detect_and_clear_missed_interrupts(fd);
-	memset(&execbuf, 0, sizeof(execbuf));
-	execbuf.buffers_ptr = (uintptr_t)obj;
-	execbuf.buffer_count = 2;
-	execbuf.flags = ring;
-	if (gen < 6)
-		execbuf.flags |= I915_EXEC_SECURE;
-
-	memset(obj, 0, sizeof(obj));
-	obj[0].handle = gem_create(fd, 4096);
-	obj[1].handle = gem_create(fd, 4096);
-
-	memset(&reloc, 0, sizeof(reloc));
-	reloc.target_handle = obj[0].handle;
-	reloc.presumed_offset = 0;
-	reloc.offset = sizeof(uint32_t);
-	reloc.delta = 0;
-	reloc.read_domains = I915_GEM_DOMAIN_INSTRUCTION;
-	reloc.write_domain = I915_GEM_DOMAIN_INSTRUCTION;
-	obj[1].relocs_ptr = (uintptr_t)&reloc;
-	obj[1].relocation_count = 1;
 
 	i = 0;
 	batch[i] = MI_STORE_DWORD_IMM | (gen < 6 ? 1 << 22 : 0);
 	if (gen >= 8) {
 		batch[++i] = 0;
 		batch[++i] = 0;
+		reloc_sz = sizeof(uint64_t);
 	} else if (gen >= 4) {
 		batch[++i] = 0;
 		batch[++i] = 0;
@@ -88,133 +93,71 @@ static void store_dword(int fd, unsigned ring)
 		batch[i]--;
 		batch[++i] = 0;
 	}
-	batch[++i] = 0xc0ffee;
-	batch[++i] = MI_BATCH_BUFFER_END;
-	gem_write(fd, obj[1].handle, 0, batch, sizeof(batch));
-	gem_execbuf(fd, &execbuf);
-	gem_close(fd, obj[1].handle);
-
-	gem_read(fd, obj[0].handle, 0, batch, sizeof(batch));
-	gem_close(fd, obj[0].handle);
-	igt_assert_eq(*batch, 0xc0ffee);
-	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
-}
-
-static void store_all(int fd)
-{
-	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
-	unsigned int permuted[I915_EXEC_RING_MASK + 1];
-	unsigned int engines[I915_EXEC_RING_MASK + 1];
-	struct drm_i915_gem_exec_object2 obj[2];
-	struct drm_i915_gem_relocation_entry reloc[2 * ARRAY_SIZE(engines)];
-	struct drm_i915_gem_execbuffer2 execbuf;
-	uint32_t batch[16];
-	uint64_t offset;
-	unsigned nengine;
-	int value;
-	int i, j;
-
-	if (!gem_can_store_dword(fd, 0))
-		return;
-
-	memset(&execbuf, 0, sizeof(execbuf));
-	execbuf.buffers_ptr = (uintptr_t)obj;
-	execbuf.buffer_count = 2;
-	if (gen < 6)
-		execbuf.flags |= I915_EXEC_SECURE;
-
-	memset(reloc, 0, sizeof(reloc));
-	memset(obj, 0, sizeof(obj));
-	obj[0].handle = gem_create(fd, 4096);
-	obj[1].handle = gem_create(fd, 4096);
-	obj[1].relocation_count = 1;
-
-	offset = sizeof(uint32_t);
-	i = 0;
-	batch[i] = MI_STORE_DWORD_IMM | (gen < 6 ? 1 << 22 : 0);
-	if (gen >= 8) {
-		batch[++i] = 0;
-		batch[++i] = 0;
-	} else if (gen >= 4) {
-		batch[++i] = 0;
-		batch[++i] = 0;
-		offset += sizeof(uint32_t);
-	} else {
-		batch[i]--;
-		batch[++i] = 0;
-	}
 	batch[value = ++i] = 0xc0ffee;
 	batch[++i] = MI_BATCH_BUFFER_END;
 
 	nengine = 0;
-	intel_detect_and_clear_missed_interrupts(fd);
-	for_each_engine(e, fd) {
-		if (!gem_can_store_dword(fd, eb_ring(e)))
+	cs = gem_mmap__device_coherent(i915, obj[1].handle, 0, sz, PROT_WRITE);
+
+	ctx = intel_ctx_create_all_physical(i915);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
+	if (ahnd)
+		obj[1].relocation_count = 0;
+	bb_offset = get_offset(ahnd, obj[1].handle, sz, 4096);
+	offset = get_offset(ahnd, obj[0].handle, sizeof(engines), 0);
+
+	for_each_ctx_engine(i915, ctx, e) {
+		uint64_t addr;
+
+		igt_assert(reloc.presumed_offset != -1);
+		addr = reloc.presumed_offset + reloc.delta;
+
+		if (!gem_class_can_store_dword(i915, e->class))
 			continue;
 
-		igt_assert(2 * (nengine + 1) * sizeof(batch) <= 4096);
-
-		execbuf.flags &= ~ENGINE_MASK;
-		execbuf.flags |= eb_ring(e);
-
-		j = 2*nengine;
-		reloc[j].target_handle = obj[0].handle;
-		reloc[j].presumed_offset = ~0;
-		reloc[j].offset = j*sizeof(batch) + offset;
-		reloc[j].delta = nengine*sizeof(uint32_t);
-		reloc[j].read_domains = I915_GEM_DOMAIN_INSTRUCTION;
-		reloc[j].write_domain = I915_GEM_DOMAIN_INSTRUCTION;
-		obj[1].relocs_ptr = (uintptr_t)&reloc[j];
-
-		batch[value] = 0xdeadbeef;
-		gem_write(fd, obj[1].handle, j*sizeof(batch),
-			  batch, sizeof(batch));
-		execbuf.batch_start_offset = j*sizeof(batch);
-		gem_execbuf(fd, &execbuf);
-
-		j = 2*nengine + 1;
-		reloc[j].target_handle = obj[0].handle;
-		reloc[j].presumed_offset = ~0;
-		reloc[j].offset = j*sizeof(batch) + offset;
-		reloc[j].delta = nengine*sizeof(uint32_t);
-		reloc[j].read_domains = I915_GEM_DOMAIN_INSTRUCTION;
-		reloc[j].write_domain = I915_GEM_DOMAIN_INSTRUCTION;
-		obj[1].relocs_ptr = (uintptr_t)&reloc[j];
+		if (ahnd) {
+			i = 1;
+			batch[i++] = offset + reloc.delta;
+			batch[i++] = offset >> 32;
+			obj[0].offset = offset;
+			obj[0].flags |= EXEC_OBJECT_PINNED;
+			obj[1].offset = bb_offset;
+			obj[1].flags |= EXEC_OBJECT_PINNED;
+		}
 
 		batch[value] = nengine;
-		gem_write(fd, obj[1].handle, j*sizeof(batch),
-			  batch, sizeof(batch));
-		execbuf.batch_start_offset = j*sizeof(batch);
-		gem_execbuf(fd, &execbuf);
 
-		engines[nengine++] = eb_ring(e);
+		execbuf.flags = e->flags;
+		if (gen < 6)
+			execbuf.flags |= I915_EXEC_SECURE;
+		execbuf.flags |= I915_EXEC_NO_RELOC | I915_EXEC_HANDLE_LUT;
+		execbuf.rsvd1 = ctx->id;
+
+		memcpy(cs + execbuf.batch_start_offset, batch, sizeof(batch));
+		if (!ahnd)
+			memcpy(cs + reloc.offset, &addr, reloc_sz);
+		gem_execbuf(i915, &execbuf);
+
+		if (++nengine == ARRAY_SIZE(engines))
+			break;
+
+		reloc.delta += sizeof(uint32_t);
+		reloc.offset += sizeof(batch);
+		execbuf.batch_start_offset += sizeof(batch);
 	}
-	gem_sync(fd, obj[1].handle);
+	munmap(cs, sz);
+	gem_close(i915, obj[1].handle);
 
-	for (i = 0; i < nengine; i++) {
-		obj[1].relocs_ptr = (uintptr_t)&reloc[2*i];
-		execbuf.batch_start_offset = 2*i*sizeof(batch);
-		memcpy(permuted, engines, nengine*sizeof(engines[0]));
-		igt_permute_array(permuted, nengine, igt_exchange_int);
-		for (j = 0; j < nengine; j++) {
-			execbuf.flags &= ~ENGINE_MASK;
-			execbuf.flags |= permuted[j];
-			gem_execbuf(fd, &execbuf);
-		}
-		obj[1].relocs_ptr = (uintptr_t)&reloc[2*i+1];
-		execbuf.batch_start_offset = (2*i+1)*sizeof(batch);
-		execbuf.flags &= ~ENGINE_MASK;
-		execbuf.flags |= engines[i];
-		gem_execbuf(fd, &execbuf);
-	}
-	gem_close(fd, obj[1].handle);
-
-	gem_read(fd, obj[0].handle, 0, engines, sizeof(engines));
-	gem_close(fd, obj[0].handle);
+	memset(engines, 0xdeadbeef, sizeof(engines));
+	gem_read(i915, obj[0].handle, 0, engines, nengine * sizeof(engines[0]));
+	gem_close(i915, obj[0].handle);
+	intel_ctx_destroy(i915, ctx);
+	put_offset(ahnd, obj[0].handle);
+	put_offset(ahnd, obj[1].handle);
+	put_ahnd(ahnd);
 
 	for (i = 0; i < nengine; i++)
 		igt_assert_eq_u32(engines[i], i);
-	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
 }
 
 static int open_parameters(const char *module_name)
@@ -223,6 +166,33 @@ static int open_parameters(const char *module_name)
 
 	snprintf(path, sizeof(path), "/sys/module/%s/parameters", module_name);
 	return open(path, O_RDONLY);
+}
+
+static void unload_or_die(const char *module_name)
+{
+	int err, loop;
+
+	/* should be unloaded, so expect a no-op */
+	for (loop = 0;; loop++) {
+		err = igt_kmod_unload(module_name, 0);
+		if (err == -ENOENT) /* -ENOENT == unloaded already */
+			err = 0;
+		if (!err || loop >= 10)
+			break;
+
+		sleep(1); /* wait for external clients to drop */
+		if (!strcmp(module_name, "i915"))
+			igt_i915_driver_unload();
+	}
+
+	igt_abort_on_f(err,
+		       "Failed to unload '%s' err:%d after %ds, leaving dangerous modparams intact!\n",
+		       module_name, err, loop);
+}
+
+static void must_unload(int sig)
+{
+	unload_or_die("i915");
 }
 
 static int
@@ -254,42 +224,22 @@ inject_fault(const char *module_name, const char *opt, int fault)
 	return fault;
 }
 
-static void
-gem_sanitycheck(void)
+static void gem_sanitycheck(void)
 {
-	int err = 0;
-	int fd;
-	struct drm_i915_gem_caching args = {};
+	struct drm_i915_gem_busy args = {};
+	int i915 = __drm_open_driver(DRIVER_INTEL);
+	int expected = -ENOENT;
+	int err;
 
-
-	fd = __drm_open_driver(DRIVER_INTEL);
-	igt_set_timeout(1, "Module reload timeout!");
-
-	if (ioctl(fd, DRM_IOCTL_I915_GEM_SET_CACHING, &args) < 0)
+	err = 0;
+	if (ioctl(i915,DRM_IOCTL_I915_GEM_BUSY, &args))
 		err = -errno;
+	if (err == expected)
+		store_all(i915);
+	errno = 0;
 
-	igt_set_timeout(0, NULL);
-	close(fd);
-
-	igt_assert_eq(err, -ENOENT);
-}
-
-static void
-gem_exec_store(void)
-{
-	int fd;
-	const struct intel_execution_engine *e;
-
-	fd = __drm_open_driver(DRIVER_INTEL);
-	igt_fork_hang_detector(fd);
-
-	for (e = intel_execution_engines; e->name; e++)
-		store_dword(fd, eb_ring(e));
-
-	store_all(fd);
-
-	igt_stop_hang_detector();
-	close(fd);
+	close(i915);
+	igt_assert_eq(err, expected);
 }
 
 static void
@@ -319,25 +269,99 @@ hda_dynamic_debug(bool enable)
 	fclose(fp);
 }
 
+static void load_and_check_i915(void)
+{
+	int error;
+	int drm_fd;
+
+	hda_dynamic_debug(true);
+	error = igt_i915_driver_load(NULL);
+	hda_dynamic_debug(false);
+
+	igt_assert_eq(error, 0);
+
+	/* driver is ready, check if it's bound */
+	drm_fd = __drm_open_driver(DRIVER_INTEL);
+	igt_fail_on_f(drm_fd < 0, "Cannot open the i915 DRM driver after modprobing i915.\n");
+
+	/* make sure the GPU is idle */
+	gem_quiescent_gpu(drm_fd);
+	close(drm_fd);
+
+	/* make sure we can do basic memory ops */
+	gem_sanitycheck();
+}
+
+static uint32_t  driver_load_with_lmem_bar_size(uint32_t lmem_bar_size, bool check_support)
+{
+	int i915 = -1;
+	char lmem_bar[64];
+
+	igt_i915_driver_unload();
+	if (lmem_bar_size == 0)
+		igt_assert_eq(igt_i915_driver_load(NULL), 0);
+	else {
+		sprintf(lmem_bar, "lmem_bar_size=%u", lmem_bar_size);
+		igt_assert_eq(igt_i915_driver_load(lmem_bar), 0);
+	}
+
+	i915 = __drm_open_driver(DRIVER_INTEL);
+	igt_require_fd(i915);
+	igt_require_gem(i915);
+	igt_require(gem_has_lmem(i915));
+
+	if (check_support) {
+		char *tmp;
+
+		tmp = __igt_params_get(i915, "lmem_bar_size");
+		if (!tmp)
+			igt_skip("lmem_bar_size modparam not supported on this kernel. Skipping the test.\n");
+		free(tmp);
+	}
+
+	for_each_memory_region(r, i915) {
+		if (r->ci.memory_class == I915_MEMORY_CLASS_DEVICE) {
+			lmem_bar_size = (r->cpu_size >> BAR_SIZE_SHIFT);
+
+			igt_skip_on_f(lmem_bar_size == 0, "CPU visible size should be greater than zero. Skipping for older kernel.\n");
+		}
+	}
+
+	close(i915);
+
+	return lmem_bar_size;
+}
+
 igt_main
 {
-	igt_subtest("reload") {
-		int load_error;
+	igt_describe("Check if i915 and friends are not yet loaded, then load them.");
+	igt_subtest("load") {
+		const char * unwanted_drivers[] = {
+			"i915",
+			"intel-gtt",
+			"snd_hda_intel",
+			"snd_hdmi_lpe_audio",
+			NULL
+		};
 
+		for (int i = 0; unwanted_drivers[i] != NULL; i++) {
+			igt_skip_on_f(igt_kmod_is_loaded(unwanted_drivers[i]),
+			              "%s is already loaded\n", unwanted_drivers[i]);
+		}
+
+		load_and_check_i915();
+	}
+
+	igt_describe("Verify the basic functionality of i915 driver after it's reloaded.");
+	igt_subtest("reload") {
 		igt_i915_driver_unload();
 
-		hda_dynamic_debug(true);
-		load_error = igt_i915_driver_load(NULL);
-		hda_dynamic_debug(false);
-
-		igt_assert_eq(load_error, 0);
-
-		gem_sanitycheck();
-		gem_exec_store();
+		load_and_check_i915();
 
 		/* only default modparams, can leave module loaded */
 	}
 
+	igt_describe("Verify that i915 driver can be successfully loaded with disabled display.");
 	igt_subtest("reload-no-display") {
 		igt_i915_driver_unload();
 
@@ -346,24 +370,86 @@ igt_main
 		igt_i915_driver_unload();
 	}
 
+	igt_describe("Verify that i915 driver can be successfully reloaded at least once"
+		     " with fault injection.");
 	igt_subtest("reload-with-fault-injection") {
 		const char *param;
-		int i = 0;
+		int i;
 
 		igt_i915_driver_unload();
+
+		/*
+		 * inject_fault() leaves the module unloaded, but if that fails
+		 * we must abort the run. Otherwise, we leave a dangerous
+		 * modparam affecting all subsequent tests causing bizarre
+		 * failures.
+		 */
+		igt_install_exit_handler(must_unload);
+
+		i = 0;
+		param = getenv("IGT_SRANDOM");
+		if (param)
+			i = atoi(param);
+		if (!i)
+			i = time(NULL);
+		igt_info("Using IGT_SRANDOM=%d for randomised faults\n", i);
+		srandom(i);
 
 		param = "inject_probe_failure";
 		if (!igt_kmod_has_param("i915", param))
 			param = "inject_load_failure";
 		igt_require(igt_kmod_has_param("i915", param));
 
-		while (inject_fault("i915", param, ++i) == 0)
-			;
+		i = 1;
+		while (inject_fault("i915", param, i) == 0)
+			i += 1 + random() % 17;
 
-		/* We expect to hit at least one fault! */
-		igt_assert(i > 1);
+		unload_or_die("i915");
+	}
 
-		/* inject_fault() leaves the module unloaded */
+	igt_describe("Check whether lmem bar size can be resized to only supported sizes.");
+	igt_subtest("resize-bar") {
+		uint32_t result_bar_size;
+		uint32_t lmem_bar_size;
+		int i915 = -1;
+
+		if (igt_kmod_is_loaded("i915")) {
+			i915 = __drm_open_driver(DRIVER_INTEL);
+			igt_require_fd(i915);
+			igt_require_gem(i915);
+			igt_require(gem_has_lmem(i915));
+			igt_skip_on_f(igt_sysfs_get_num_gt(i915) > 1, "Skips for more than one lmem instance.\n");
+			close(i915);
+		}
+
+		/* Test for lmem_bar_size modparam support */
+		lmem_bar_size = driver_load_with_lmem_bar_size(MIN_BAR_SIZE, true);
+		igt_skip_on_f(lmem_bar_size != MIN_BAR_SIZE, "Device lacks PCI resizeable BAR support.\n");
+
+		lmem_bar_size = driver_load_with_lmem_bar_size(0, false);
+
+		lmem_bar_size = roundup_power_of_two(lmem_bar_size);
+
+		igt_skip_on_f(lmem_bar_size == MIN_BAR_SIZE, "Bar is already set to minimum size.\n");
+
+		while (lmem_bar_size > MIN_BAR_SIZE) {
+			lmem_bar_size = lmem_bar_size >> 1;
+
+			result_bar_size = driver_load_with_lmem_bar_size(lmem_bar_size, false);
+
+			igt_assert_f(lmem_bar_size == result_bar_size, "Bar couldn't be resized.\n");
+		}
+
+		/* Test with unsupported sizes */
+		lmem_bar_size = 80;
+		result_bar_size = driver_load_with_lmem_bar_size(lmem_bar_size, false);
+		igt_assert_f(lmem_bar_size != result_bar_size, "Bar resized to unsupported size.\n");
+
+		lmem_bar_size = 16400;
+		result_bar_size = driver_load_with_lmem_bar_size(lmem_bar_size, false);
+		igt_assert_f(lmem_bar_size != result_bar_size, "Bar resized to unsupported size.\n");
+
+		igt_i915_driver_unload();
 	}
 
 	/* Subtests should unload the module themselves if they use modparams */

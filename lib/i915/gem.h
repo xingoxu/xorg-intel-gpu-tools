@@ -25,6 +25,8 @@
 #ifndef I915_GEM_H
 #define I915_GEM_H
 
+#include <stdint.h>
+
 void igt_require_gem(int i915);
 void gem_quiescent_gpu(int i915);
 

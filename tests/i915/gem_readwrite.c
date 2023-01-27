@@ -35,7 +35,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+
 #include "drm.h"
+#include "i915/gem_create.h"
 
 #define OBJECT_SIZE 16384
 
@@ -83,6 +85,7 @@ igt_main
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
+		gem_require_pread_pwrite(fd);
 
 		handle = gem_create(fd, OBJECT_SIZE);
 	}

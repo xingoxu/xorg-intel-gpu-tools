@@ -42,9 +42,17 @@
 #include <limits.h>
 #include "drm.h"
 
+#ifdef __linux__
 #include <linux/unistd.h>
+#endif
 
-#define sigev_notify_thread_id _sigev_un._tid
+#include "i915/gem_create.h"
+#include "i915/gem_ring.h"
+#include "igt_aux.h"
+
+#ifdef __FreeBSD__
+#include "igt_freebsd.h"
+#endif
 
 static volatile int done;
 
@@ -88,7 +96,7 @@ static void *gem_busyspin(void *arg)
 	fd = drm_open_driver(DRIVER_INTEL);
 
 	nengine = 0;
-	for_each_physical_engine(e, fd)
+	for_each_physical_ring(e, fd)
 		engines[nengine++] = eb_ring(e);
 
 	memset(obj, 0, sizeof(obj));

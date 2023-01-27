@@ -81,7 +81,7 @@ static void prepare_crtc(data_t *data, int fd, igt_output_t *output)
 	mode = igt_output_get_mode(output);
 	igt_create_color_fb(fd, mode->hdisplay, mode->vdisplay,
 			    DRM_FORMAT_XRGB8888,
-			    LOCAL_DRM_FORMAT_MOD_NONE,
+			    DRM_FORMAT_MOD_LINEAR,
 			    0.0, 0.0, 0.0,
 			    &data->primary_fb);
 
@@ -96,6 +96,8 @@ static void prepare_crtc(data_t *data, int fd, igt_output_t *output)
 
 static void cleanup_crtc(data_t *data, int fd, igt_output_t *output)
 {
+	igt_output_set_pipe(output, PIPE_NONE);
+	igt_display_commit(&data->display);
 	igt_remove_fb(fd, &data->primary_fb);
 }
 
@@ -116,6 +118,7 @@ static void run_test(data_t *data, void (*testfunc)(data_t *, int, int))
 	igt_output_t *output = data->output;
 	int fd = display->drm_fd;
 	igt_hang_t hang;
+	uint64_t ahnd = 0;
 
 	prepare_crtc(data, fd, output);
 
@@ -126,8 +129,10 @@ static void run_test(data_t *data, void (*testfunc)(data_t *, int, int))
 		 igt_subtest_name(), kmstest_pipe_name(data->pipe),
 		 igt_output_name(output));
 
-	if (!(data->flags & NOHANG))
-		hang = igt_hang_ring(fd, I915_EXEC_DEFAULT);
+	if (!(data->flags & NOHANG)) {
+		ahnd = get_reloc_ahnd(fd, 0);
+		hang = igt_hang_ring_with_ahnd(fd, I915_EXEC_DEFAULT, ahnd);
+	}
 
 	if (data->flags & BUSY) {
 		union drm_wait_vblank vbl;
@@ -163,6 +168,8 @@ static void run_test(data_t *data, void (*testfunc)(data_t *, int, int))
 
 	igt_info("\n%s on pipe %s, connector %s: PASSED\n\n",
 		 igt_subtest_name(), kmstest_pipe_name(data->pipe), igt_output_name(output));
+
+	put_ahnd(ahnd);
 
 	/* cleanup what prepare_crtc() has done */
 	cleanup_crtc(data, fd, output);
@@ -230,14 +237,14 @@ static void accuracy(data_t *data, int fd, int nchildren)
 	int n;
 
 	memset(&vbl, 0, sizeof(vbl));
-	vbl.request.type = DRM_VBLANK_RELATIVE;
+	vbl.request.type = _DRM_VBLANK_RELATIVE;
 	vbl.request.type |= pipe_id_flag;
 	vbl.request.sequence = 1;
 	igt_assert_eq(wait_vblank(fd, &vbl), 0);
 
 	target = vbl.reply.sequence + total;
 	for (n = 0; n < total; n++) {
-		vbl.request.type = DRM_VBLANK_RELATIVE;
+		vbl.request.type = _DRM_VBLANK_RELATIVE;
 		vbl.request.type |= pipe_id_flag;
 		vbl.request.sequence = 1;
 		igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -247,7 +254,7 @@ static void accuracy(data_t *data, int fd, int nchildren)
 		vbl.request.sequence = target;
 		igt_assert_eq(wait_vblank(fd, &vbl), 0);
 	}
-	vbl.request.type = DRM_VBLANK_RELATIVE;
+	vbl.request.type = _DRM_VBLANK_RELATIVE;
 	vbl.request.type |= pipe_id_flag;
 	vbl.request.sequence = 0;
 	igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -268,7 +275,7 @@ static void vblank_query(data_t *data, int fd, int nchildren)
 	unsigned long sq, count = 0;
 
 	memset(&vbl, 0, sizeof(vbl));
-	vbl.request.type = DRM_VBLANK_RELATIVE;
+	vbl.request.type = _DRM_VBLANK_RELATIVE;
 	vbl.request.type |= pipe_id_flag;
 	vbl.request.sequence = 0;
 	igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -277,7 +284,7 @@ static void vblank_query(data_t *data, int fd, int nchildren)
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	do {
-		vbl.request.type = DRM_VBLANK_RELATIVE;
+		vbl.request.type = _DRM_VBLANK_RELATIVE;
 		vbl.request.type |= pipe_id_flag;
 		vbl.request.sequence = 0;
 		igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -297,7 +304,7 @@ static void vblank_wait(data_t *data, int fd, int nchildren)
 	unsigned long sq, count = 0;
 
 	memset(&vbl, 0, sizeof(vbl));
-	vbl.request.type = DRM_VBLANK_RELATIVE;
+	vbl.request.type = _DRM_VBLANK_RELATIVE;
 	vbl.request.type |= pipe_id_flag;
 	vbl.request.sequence = 0;
 	igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -306,7 +313,7 @@ static void vblank_wait(data_t *data, int fd, int nchildren)
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	do {
-		vbl.request.type = DRM_VBLANK_RELATIVE;
+		vbl.request.type = _DRM_VBLANK_RELATIVE;
 		vbl.request.type |= pipe_id_flag;
 		vbl.request.sequence = 1;
 		igt_assert_eq(wait_vblank(fd, &vbl), 0);
@@ -367,7 +374,7 @@ static void vblank_ts_cont(data_t *data, int fd, int nchildren)
 	if (data->flags & (MODESET | DPMS)) {
 		/* Attempting to do a vblank while disabled should return -EINVAL */
 		memset(&vbl, 0, sizeof(vbl));
-		vbl.request.type = DRM_VBLANK_RELATIVE;
+		vbl.request.type = _DRM_VBLANK_RELATIVE;
 		vbl.request.type |= kmstest_get_vbl_flag(data->pipe);
 		igt_assert_eq(wait_vblank(fd, &vbl), -EINVAL);
 	}
@@ -438,6 +445,7 @@ static void run_subtests_for_pipe(data_t *data)
 			if (m->flags & ~(f->valid | NOHANG))
 				continue;
 
+			igt_describe("Check if test run while hanging by introducing NOHANG flag");
 			igt_subtest_f("pipe-%s-%s-%s",
 				      kmstest_pipe_name(data->pipe),
 				      f->name, m->name) {
@@ -451,6 +459,7 @@ static void run_subtests_for_pipe(data_t *data)
 			if (f->valid & NOHANG || m->flags & NOHANG)
 				continue;
 
+			igt_describe("check if injected hang is working properly");
 			igt_subtest_f("pipe-%s-%s-%s-hang",
 				      kmstest_pipe_name(data->pipe),
 				      f->name, m->name) {
@@ -471,12 +480,19 @@ static void invalid_subtest(data_t *data, int fd)
 {
 	union drm_wait_vblank vbl;
 	unsigned long valid_flags;
+	igt_display_t* display = &data->display;
+	enum pipe pipe = 0;
+	igt_output_t* output = igt_get_single_output_for_pipe(display, pipe);
 
-	igt_display_require_output_on_pipe(&data->display, 0);
+	data->pipe = pipe;
+	data->output = output;
+	igt_output_set_pipe(output, pipe);
+	igt_display_require_output_on_pipe(display, pipe);
+	prepare_crtc(data, fd, output);
 
 	/* First check all is well with a simple query */
 	memset(&vbl, 0, sizeof(vbl));
-	vbl.request.type = DRM_VBLANK_RELATIVE;
+	vbl.request.type = _DRM_VBLANK_RELATIVE;
 	igt_assert_eq(wait_vblank(fd, &vbl), 0);
 
 	valid_flags = (_DRM_VBLANK_TYPES_MASK |
@@ -507,6 +523,8 @@ static void invalid_subtest(data_t *data, int fd)
 	vbl.request.type |= _DRM_VBLANK_SECONDARY;
 	vbl.request.type |= _DRM_VBLANK_FLAGS_MASK;
 	igt_assert_eq(wait_vblank(fd, &vbl), -EINVAL);
+
+	cleanup_crtc(data, fd, output);
 }
 
 igt_main
@@ -521,13 +539,19 @@ igt_main
 		igt_display_require_output(&data.display);
 	}
 
+	igt_describe("Negative test for vblank request");
 	igt_subtest("invalid")
 		invalid_subtest(&data, fd);
 
+	igt_describe("check the Vblank and flip events works with given crtc id");
 	igt_subtest("crtc-id")
 		crtc_id_subtest(&data, fd);
 
 	for_each_pipe_static(data.pipe)
 		igt_subtest_group
 			run_subtests_for_pipe(&data);
+
+	igt_fixture {
+		close(fd);
+	}
 }

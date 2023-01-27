@@ -41,8 +41,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <pthread.h>
-#include "drm.h"
 
+#include "drm.h"
+#include "i915/gem_create.h"
 #include "igt_vgem.h"
 
 #define MiB(x) ((x) * 1024 * 1024)
@@ -299,6 +300,7 @@ igt_main_args("s:", NULL, help_str, opt_handler, NULL)
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
+		gem_require_pread_pwrite(fd);
 
 		dst = gem_create(fd, object_size);
 		src = malloc(object_size);

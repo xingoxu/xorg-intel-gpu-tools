@@ -31,15 +31,17 @@
 #include <i915_drm.h>
 
 #include "drmtest.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_engine_topology.h"
 #include "i915/gem_mman.h"
 #include "i915/gem_submission.h"
+#include "igt_aux.h"
 #include "igt_core.h"
 #include "igt_device.h"
 #include "igt_dummyload.h"
 #include "igt_gt.h"
 #include "igt_vgem.h"
+#include "intel_allocator.h"
 #include "intel_chipset.h"
 #include "intel_reg.h"
 #include "ioctl_wrappers.h"
@@ -92,16 +94,26 @@ emit_recursive_batch(igt_spin_t *spin,
 {
 #define SCRATCH 0
 #define BATCH IGT_SPIN_BATCH
-	const int gen = intel_gen(intel_get_drm_devid(fd));
+	const unsigned int devid = intel_get_drm_devid(fd);
+	const unsigned int gen = intel_gen(devid);
 	struct drm_i915_gem_relocation_entry relocs[3], *r;
 	struct drm_i915_gem_execbuffer2 *execbuf;
 	struct drm_i915_gem_exec_object2 *obj;
 	unsigned int flags[GEM_MAX_ENGINES];
+	unsigned int objflags = 0;
 	unsigned int nengine;
 	int fence_fd = -1;
-	uint64_t addr;
+	uint64_t addr, addr_scratch, ahnd = opts->ahnd;
 	uint32_t *cs;
 	int i;
+
+	igt_assert(!(opts->ctx && opts->ctx_id));
+
+	r = memset(relocs, 0, sizeof(relocs));
+	execbuf = memset(&spin->execbuf, 0, sizeof(spin->execbuf));
+	execbuf->rsvd1 = opts->ctx ? opts->ctx->id : opts->ctx_id;
+	execbuf->flags = I915_EXEC_NO_RELOC;
+	obj = memset(spin->obj, 0, sizeof(spin->obj));
 
 	/*
 	 * Pick a random location for our spinner et al.
@@ -117,17 +129,27 @@ emit_recursive_batch(igt_spin_t *spin,
 	 * are not allowed in the first 256KiB, for fear of negative relocations
 	 * that wrap.
 	 */
+
 	addr = gem_aperture_size(fd) / 2;
-	if (addr >> 31)
-		addr = 1 << 31;
-	addr += random() % addr / 2;
-	addr &= -4096;
+	if (addr >> 32)
+		objflags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+
+	if (!ahnd) {
+		addr /= 2;
+		if (addr >> 31)
+			addr = 1u << 31;
+		addr += random() % addr / 2;
+		addr &= -4096;
+	} else {
+		objflags |= EXEC_OBJECT_PINNED;
+	}
 
 	nengine = 0;
 	if (opts->engine == ALL_ENGINES) {
 		struct intel_execution_engine2 *engine;
 
-		for_each_context_engine(fd, opts->ctx, engine) {
+		igt_assert(opts->ctx);
+		for_each_ctx_engine(fd, opts->ctx, engine) {
 			if (opts->flags & IGT_SPIN_POLL_RUN &&
 			    !gem_class_can_store_dword(fd, engine->class))
 				continue;
@@ -139,11 +161,6 @@ emit_recursive_batch(igt_spin_t *spin,
 	}
 	igt_require(nengine);
 
-	memset(relocs, 0, sizeof(relocs));
-	execbuf = memset(&spin->execbuf, 0, sizeof(spin->execbuf));
-	execbuf->flags = I915_EXEC_NO_RELOC;
-	obj = memset(spin->obj, 0, sizeof(spin->obj));
-
 	obj[BATCH].handle =
 		handle_create(fd, BATCH_SIZE, opts->flags, &spin->batch);
 	if (!spin->batch) {
@@ -151,35 +168,51 @@ emit_recursive_batch(igt_spin_t *spin,
 						  0, BATCH_SIZE, PROT_WRITE);
 		gem_set_domain(fd, obj[BATCH].handle,
 			       I915_GEM_DOMAIN_GTT, I915_GEM_DOMAIN_GTT);
+	} else if (gen < 6) {
+		gem_set_caching(fd, obj[BATCH].handle, I915_CACHING_NONE);
+		igt_require(igt_setup_clflush());
+		spin->flags |= SPIN_CLFLUSH;
 	}
 	execbuf->buffer_count++;
 	cs = spin->batch;
 
-	obj[BATCH].offset = addr;
+	if (ahnd)
+		addr = intel_allocator_alloc_with_strategy(ahnd, obj[BATCH].handle,
+							   BATCH_SIZE, 0,
+							   ALLOC_STRATEGY_LOW_TO_HIGH);
+	obj[BATCH].offset = CANONICAL(addr);
+	obj[BATCH].flags = objflags;
+
 	addr += BATCH_SIZE;
 
 	if (opts->dependency) {
 		igt_assert(!(opts->flags & IGT_SPIN_POLL_RUN));
+		if (ahnd)
+			addr_scratch = intel_allocator_alloc_with_strategy(ahnd, opts->dependency,
+									   BATCH_SIZE, 0,
+									   ALLOC_STRATEGY_LOW_TO_HIGH);
+		else
+			addr_scratch = addr;
 
 		obj[SCRATCH].handle = opts->dependency;
-		obj[SCRATCH].offset = addr;
+		obj[SCRATCH].offset = CANONICAL(addr_scratch);
+		obj[SCRATCH].flags = objflags;
+
 		if (!(opts->flags & IGT_SPIN_SOFTDEP)) {
-			obj[SCRATCH].flags = EXEC_OBJECT_WRITE;
+			obj[SCRATCH].flags |= EXEC_OBJECT_WRITE;
 
 			/* dummy write to dependency */
-			r = &relocs[obj[BATCH].relocation_count++];
 			r->presumed_offset = obj[SCRATCH].offset;
 			r->target_handle = obj[SCRATCH].handle;
 			r->offset = sizeof(uint32_t) * 1020;
 			r->delta = 0;
 			r->read_domains = I915_GEM_DOMAIN_RENDER;
 			r->write_domain = I915_GEM_DOMAIN_RENDER;
+			r++;
 		}
 
 		execbuf->buffer_count++;
 	} else if (opts->flags & IGT_SPIN_POLL_RUN) {
-		r = &relocs[obj[BATCH].relocation_count++];
-
 		igt_assert(!opts->dependency);
 
 		if (gen == 4 || gen == 5) {
@@ -203,8 +236,15 @@ emit_recursive_batch(igt_spin_t *spin,
 								       0, 4096,
 								       PROT_READ | PROT_WRITE);
 		}
+
+		if (ahnd)
+			addr = intel_allocator_alloc_with_strategy(ahnd,
+								   spin->poll_handle,
+								   BATCH_SIZE * 3, 0,
+								   ALLOC_STRATEGY_LOW_TO_HIGH);
 		addr += 4096; /* guard page */
-		obj[SCRATCH].offset = addr;
+		obj[SCRATCH].offset = CANONICAL(addr);
+		obj[SCRATCH].flags = objflags;
 		addr += 4096;
 
 		igt_assert_eq(spin->poll[SPIN_POLL_START_IDX], 0);
@@ -218,7 +258,7 @@ emit_recursive_batch(igt_spin_t *spin,
 
 		if (gen >= 8) {
 			*cs++ = r->presumed_offset + r->delta;
-			*cs++ = 0;
+			*cs++ = (r->presumed_offset + r->delta) >> 32;
 		} else if (gen >= 4) {
 			*cs++ = 0;
 			*cs++ = r->presumed_offset + r->delta;
@@ -231,6 +271,7 @@ emit_recursive_batch(igt_spin_t *spin,
 		*cs++ = 1;
 
 		execbuf->buffer_count++;
+		r++;
 	}
 
 	spin->handle = obj[BATCH].handle;
@@ -242,9 +283,11 @@ emit_recursive_batch(igt_spin_t *spin,
 	/* Allow ourselves to be preempted */
 	if (!(opts->flags & IGT_SPIN_NO_PREEMPTION))
 		*cs++ = MI_ARB_CHK;
-	if (opts->flags & IGT_SPIN_INVALID_CS &&
-	    !gem_has_cmdparser(fd, opts->engine))
-		*cs++ = 0xdeadbeef;
+	if (opts->flags & IGT_SPIN_INVALID_CS) {
+		igt_assert(opts->ctx);
+		if (!gem_engine_has_cmdparser(fd, &opts->ctx->cfg, opts->engine))
+			*cs++ = 0xdeadbeef;
+	}
 
 	/* Pad with a few nops so that we do not completely hog the system.
 	 *
@@ -269,8 +312,6 @@ emit_recursive_batch(igt_spin_t *spin,
 	 * no matter how they modify it (from either the GPU or CPU).
 	 */
 	if (gen >= 8) { /* arbitrary cutoff between ring/execlists submission */
-		r = &relocs[obj[BATCH].relocation_count++];
-
 		/*
 		 * On Sandybridge+ the comparison is a strict greater-than:
 		 * if the value at spin->condition is greater than BB_END,
@@ -289,24 +330,27 @@ emit_recursive_batch(igt_spin_t *spin,
 		r->offset = (cs + 2 - spin->batch) * sizeof(*cs);
 		r->read_domains = I915_GEM_DOMAIN_COMMAND;
 		r->delta = (spin->condition - spin->batch) * sizeof(*cs);
+		igt_assert(r->delta < 4096);
 
 		*cs++ = MI_COND_BATCH_BUFFER_END | MI_DO_COMPARE | 2;
 		*cs++ = MI_BATCH_BUFFER_END;
 		*cs++ = r->presumed_offset + r->delta;
-		*cs++ = 0;
+		*cs++ = r->presumed_offset >> 32;
+
+		r++;
 	}
 
 	/* recurse */
-	r = &relocs[obj[BATCH].relocation_count++];
 	r->target_handle = obj[BATCH].handle;
 	r->presumed_offset = obj[BATCH].offset;
 	r->offset = (cs + 1 - spin->batch) * sizeof(*cs);
 	r->read_domains = I915_GEM_DOMAIN_COMMAND;
 	r->delta = LOOP_START_OFFSET;
+
 	if (gen >= 8) {
 		*cs++ = MI_BATCH_BUFFER_START | 1 << 8 | 1;
 		*cs++ = r->presumed_offset + r->delta;
-		*cs++ = 0;
+		*cs++ = (r->presumed_offset + r->delta) >> 32;
 	} else if (gen >= 6) {
 		*cs++ = MI_BATCH_BUFFER_START | 1 << 8;
 		*cs++ = r->presumed_offset + r->delta;
@@ -317,11 +361,10 @@ emit_recursive_batch(igt_spin_t *spin,
 		*cs = r->presumed_offset + r->delta;
 		cs++;
 	}
-	obj[BATCH].relocs_ptr = to_user_pointer(relocs);
+	r++;
 
 	execbuf->buffers_ptr =
 	       	to_user_pointer(obj + (2 - execbuf->buffer_count));
-	execbuf->rsvd1 = opts->ctx;
 
 	if (opts->flags & IGT_SPIN_FENCE_OUT)
 		execbuf->flags |= I915_EXEC_FENCE_OUT;
@@ -334,6 +377,12 @@ emit_recursive_batch(igt_spin_t *spin,
 	if (opts->flags & IGT_SPIN_FENCE_SUBMIT && opts->fence != -1) {
 		execbuf->flags |= I915_EXEC_FENCE_SUBMIT;
 		execbuf->rsvd2 = opts->fence;
+	}
+
+	/* For allocator we have to rid of relocation_count */
+	if (!ahnd) {
+		obj[BATCH].relocs_ptr = to_user_pointer(relocs);
+		obj[BATCH].relocation_count = r - relocs;
 	}
 
 	for (i = 0; i < nengine; i++) {
@@ -365,10 +414,12 @@ emit_recursive_batch(igt_spin_t *spin,
 	for (i = 0; i < ARRAY_SIZE(spin->obj); i++) {
 		spin->obj[i].relocation_count = 0;
 		spin->obj[i].relocs_ptr = 0;
-		spin->obj[i].flags = EXEC_OBJECT_PINNED;
+		spin->obj[i].offset = CANONICAL(spin->obj[i].offset);
+		spin->obj[i].flags |= EXEC_OBJECT_PINNED;
 	}
 
 	spin->cmd_precondition = *spin->condition;
+	spin->opts = *opts;
 
 	return fence_fd;
 }
@@ -414,24 +465,19 @@ igt_spin_factory(int fd, const struct igt_spin_factory *opts)
 {
 	igt_spin_t *spin;
 
-	if (opts->engine != ALL_ENGINES) {
-		struct intel_execution_engine2 e;
-		int class;
+	if ((opts->flags & IGT_SPIN_POLL_RUN) && opts->engine != ALL_ENGINES) {
+		unsigned int class;
 
-		if (!gem_context_lookup_engine(fd, opts->engine,
-					       opts->ctx, &e)) {
-			class = e.class;
-		} else {
-			gem_require_ring(fd, opts->engine);
-			class = gem_execbuf_flags_to_engine_class(opts->engine);
-		}
-
-		if (opts->flags & IGT_SPIN_POLL_RUN)
-			igt_require(gem_class_can_store_dword(fd, class));
+		igt_assert(opts->ctx);
+		class = intel_ctx_engine_class(opts->ctx, opts->engine);
+		igt_require(gem_class_can_store_dword(fd, class));
 	}
 
-	if (opts->flags & IGT_SPIN_INVALID_CS)
-		igt_require(!gem_has_cmdparser(fd, opts->engine));
+	if (opts->flags & IGT_SPIN_INVALID_CS) {
+		igt_assert(opts->ctx);
+		igt_require(!gem_engine_has_cmdparser(fd, &opts->ctx->cfg,
+						      opts->engine));
+	}
 
 	spin = spin_create(fd, opts);
 
@@ -481,9 +527,13 @@ void igt_spin_set_timeout(igt_spin_t *spin, int64_t ns)
 	pthread_attr_t attr;
 	int timerfd;
 
-	igt_assert(ns > 0);
 	if (!spin)
 		return;
+
+	if (ns <= 0) {
+		igt_spin_end(spin);
+		return;
+	}
 
 	igt_assert(spin->timerfd == -1);
 	timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
@@ -505,6 +555,14 @@ void igt_spin_set_timeout(igt_spin_t *spin, int64_t ns)
 	igt_assert(timerfd_settime(timerfd, 0, &its, NULL) == 0);
 }
 
+static void sync_write(igt_spin_t *spin, uint32_t value)
+{
+	*spin->condition = value;
+	if (spin->flags & SPIN_CLFLUSH)
+		igt_clflush_range(spin->condition, sizeof(*spin->condition));
+	__sync_synchronize();
+}
+
 /**
  * igt_spin_reset:
  * @spin: spin state from igt_spin_new()
@@ -516,9 +574,7 @@ void igt_spin_reset(igt_spin_t *spin)
 	if (igt_spin_has_poll(spin))
 		spin->poll[SPIN_POLL_START_IDX] = 0;
 
-	*spin->condition = spin->cmd_precondition;
-	__sync_synchronize();
-
+	sync_write(spin, spin->cmd_precondition);
 	memset(&spin->last_signal, 0, sizeof(spin->last_signal));
 }
 
@@ -534,8 +590,7 @@ void igt_spin_end(igt_spin_t *spin)
 		return;
 
 	igt_gettime(&spin->last_signal);
-	*spin->condition = MI_BATCH_BUFFER_END;
-	__sync_synchronize();
+	sync_write(spin, MI_BATCH_BUFFER_END);
 }
 
 static void __igt_spin_free(int fd, igt_spin_t *spin)
@@ -553,11 +608,17 @@ static void __igt_spin_free(int fd, igt_spin_t *spin)
 	if (spin->batch)
 		gem_munmap(spin->batch, BATCH_SIZE);
 
-	if (spin->poll_handle)
+	if (spin->poll_handle) {
 		gem_close(fd, spin->poll_handle);
+		if (spin->opts.ahnd)
+			intel_allocator_free(spin->opts.ahnd, spin->poll_handle);
+	}
 
-	if (spin->handle)
+	if (spin->handle) {
 		gem_close(fd, spin->handle);
+		if (spin->opts.ahnd)
+			intel_allocator_free(spin->opts.ahnd, spin->handle);
+	}
 
 	if (spin->out_fence >= 0)
 		close(spin->out_fence);

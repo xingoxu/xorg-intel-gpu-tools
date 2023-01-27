@@ -39,7 +39,9 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+
 #include "drm.h"
+#include "i915/gem_create.h"
 
 #define OBJECT_SIZE 16384
 
@@ -80,7 +82,7 @@ static inline unsigned x86_64_features(void)
 {
 	return 0;
 }
-static void streaming_load(void *src, int len)
+__noreturn static void streaming_load(void *src, int len)
 {
 	igt_assert(!"reached");
 }

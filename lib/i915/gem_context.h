@@ -30,35 +30,24 @@
 struct drm_i915_gem_context_param;
 
 uint32_t gem_context_create(int fd);
+uint32_t gem_context_create_ext(int fd, uint32_t flags, uint64_t extensions);
 int __gem_context_create(int fd, uint32_t *ctx_id);
+int __gem_context_create_ext(int fd, uint32_t flags, uint64_t extensions,
+			     uint32_t *ctx_id);
 void gem_context_destroy(int fd, uint32_t ctx_id);
 int __gem_context_destroy(int fd, uint32_t ctx_id);
 
 uint32_t gem_context_create_for_engine(int fd, unsigned int class, unsigned int inst);
-
-int __gem_context_clone(int i915,
-			uint32_t src, unsigned int share,
-			unsigned int flags,
-			uint32_t *out);
-uint32_t gem_context_clone(int i915,
-			   uint32_t src, unsigned int share,
-			   unsigned int flags);
-uint32_t gem_context_clone_with_engines(int i915, uint32_t src);
-void gem_context_copy_engines(int src_fd, uint32_t src,
-			      int dst_fd, uint32_t dst);
-
-uint32_t gem_queue_create(int i915);
-uint32_t gem_queue_clone_with_engines(int i915, uint32_t src);
+uint32_t gem_context_create_for_class(int i915, unsigned int class, unsigned int *count);
 
 bool gem_contexts_has_shared_gtt(int i915);
 bool gem_has_queues(int i915);
 
 bool gem_has_contexts(int fd);
 void gem_require_contexts(int fd);
+bool gem_context_has_single_timeline(int i915);
 void gem_context_require_bannable(int fd);
 void gem_context_require_param(int fd, uint64_t param);
-
-bool gem_has_context_clone(int i915);
 
 void gem_context_get_param(int fd, struct drm_i915_gem_context_param *p);
 void gem_context_set_param(int fd, struct drm_i915_gem_context_param *p);
@@ -68,6 +57,7 @@ int __gem_context_get_param(int fd, struct drm_i915_gem_context_param *p);
 int __gem_context_set_priority(int fd, uint32_t ctx, int prio);
 void gem_context_set_priority(int fd, uint32_t ctx, int prio);
 
+bool gem_context_has_persistence(int i915);
 int __gem_context_set_persistence(int i915, uint32_t ctx, bool state);
 void gem_context_set_persistence(int i915, uint32_t ctx, bool state);
 

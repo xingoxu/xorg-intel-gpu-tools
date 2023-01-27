@@ -18,6 +18,7 @@ assembler_warnflags = [
 	'-Wno-old-style-definition',
 	'-Wno-redundant-decls',
 	'-Wno-shadow',
+	'-Wno-incompatible-pointer-types-discards-qualifiers',
 ]
 assembler_args = []
 foreach flag : assembler_warnflags
@@ -96,7 +97,7 @@ gen4asm_testcases_broken = [
 
 test_runner = find_program('test/run-test.sh')
 foreach testcase : gen4asm_testcases
-	test('assembler: ' + testcase, test_runner,
+	test('assembler ' + testcase, test_runner,
 			args : testcase,
 			env : [ 'srcdir=' + meson.current_source_dir(),
 				'top_builddir=' + meson.current_build_dir()])

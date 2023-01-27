@@ -28,6 +28,7 @@ tools_progs = [
 	'intel_lid',
 	'intel_opregion_decode',
 	'intel_panel_fitter',
+	'intel_pm_rpm',
 	'intel_reg_checker',
 	'intel_residency',
 	'intel_stepping',
@@ -86,15 +87,12 @@ executable('intel_reg', sources : intel_reg_src,
 
 install_data('intel_gpu_abrt', install_dir : bindir)
 
-install_subdir('registers', install_dir : datadir,
-	       exclude_files : [
-		 'Makefile', 'Makefile.in', 'Makefile.am',
-	       ])
+install_subdir('registers', install_dir : datadir)
 
 executable('intel_gpu_top', 'intel_gpu_top.c',
 	   install : true,
 	   install_rpath : bindir_rpathdir,
-	   dependencies : [lib_igt_perf,lib_igt_device_scan])
+	   dependencies : [lib_igt_perf,lib_igt_device_scan,lib_igt_drm_fdinfo,math])
 
 executable('amd_hdmi_compliance', 'amd_hdmi_compliance.c',
 	   dependencies : [tool_deps],

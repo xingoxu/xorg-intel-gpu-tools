@@ -14,15 +14,18 @@ lib_tests = [
 	'igt_invalid_subtest_name',
 	'igt_nesting',
 	'igt_no_exit',
+	'igt_runnercomms_packets',
 	'igt_segfault',
 	'igt_simulation',
 	'igt_stats',
 	'igt_subtest_group',
 	'igt_thread',
+	'igt_types',
 	'i915_perf_data_alignment',
 ]
 
 lib_fail_tests = [
+	'bad_subtest_type',
 	'igt_no_subtest',
 	'igt_simple_test_subtests',
 	'igt_timeout',
@@ -38,11 +41,11 @@ endif
 foreach lib_test : lib_tests
 	exec = executable(lib_test, lib_test + '.c', install : false,
 			dependencies : igt_deps)
-	test('lib: ' + lib_test, exec)
+	test('lib ' + lib_test, exec)
 endforeach
 
 foreach lib_test : lib_fail_tests
 	exec = executable(lib_test, lib_test + '.c', install : false,
 			dependencies : igt_deps)
-	test('lib: ' + lib_test, exec, should_fail : true)
+	test('lib ' + lib_test, exec, should_fail : true)
 endforeach

@@ -35,7 +35,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+
 #include "drm.h"
+#include "i915/gem_create.h"
 
 IGT_TEST_DESCRIPTION("Check set_tiling vs pwrite coherency.");
 
@@ -55,6 +57,7 @@ igt_simple_main
 
 	fd = drm_open_driver(DRIVER_INTEL);
 	igt_require(gem_available_fences(fd) > 0);
+	gem_require_pread_pwrite(fd);
 
 	for (int i = 0; i < OBJECT_SIZE/4; i++)
 		data[i] = i;

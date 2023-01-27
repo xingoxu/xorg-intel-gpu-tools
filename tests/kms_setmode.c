@@ -37,10 +37,16 @@
 /* max combinations with repetitions */
 #define MAX_COMBINATION_ELEMS   MAX_CRTCS
 
+/* restricted pipe count */
+#define CRTC_RESTRICT_CNT 2
+
+#define MAX_HDISPLAY_PER_CRTC 5120
+
 static int drm_fd;
 static drmModeRes *drm_resources;
 static int filter_test_id;
 static bool dry_run;
+static bool extended = false;
 
 const drmModeModeInfo mode_640_480 = {
 	.name		= "640x480",
@@ -177,7 +183,7 @@ static void create_fb_for_crtc(struct crtc_config *crtc,
 	fb_id = igt_create_pattern_fb(drm_fd, crtc->mode.hdisplay,
 				      crtc->mode.vdisplay,
 				      igt_bpp_depth_to_drm_format(bpp, depth),
-				      LOCAL_DRM_FORMAT_MOD_NONE,
+				      DRM_FORMAT_MOD_LINEAR,
 				      fb_info);
 	igt_assert_lt(0, fb_id);
 }
@@ -255,7 +261,8 @@ static void get_crtc_config_str(struct crtc_config *crtc, char *buf,
 	}
 }
 
-static void setup_crtcs(drmModeRes *resources, struct connector_config *cconf,
+static void setup_crtcs(const struct test_config *tconf,
+			struct connector_config *cconf,
 			int connector_count, struct crtc_config *crtcs,
 			int *crtc_count_ret, bool *config_valid_ret)
 {
@@ -263,6 +270,7 @@ static void setup_crtcs(drmModeRes *resources, struct connector_config *cconf,
 	int crtc_count;
 	bool config_valid;
 	int i;
+	drmModeRes *resources = tconf->resources;
 	int encoder_usage_count[resources->count_encoders];
 
 	kmstest_unset_all_crtcs(drm_fd, resources);
@@ -351,7 +359,8 @@ static void setup_crtcs(drmModeRes *resources, struct connector_config *cconf,
 		drmModeFreeEncoder(encoder);
 	}
 	for (i = 0; i < resources->count_encoders; i++)
-		if (encoder_usage_count[i] > 1)
+		if (encoder_usage_count[i] > 1 &&
+				!!(tconf->flags & TEST_SINGLE_CRTC_CLONE))
 			config_valid = false;
 
 	*crtc_count_ret = crtc_count;
@@ -411,15 +420,8 @@ static int test_stealing(int fd, struct crtc_config *crtc, uint32_t *ids)
 	return ret;
 }
 
-static double frame_time(const drmModeModeInfo *kmode)
-{
-	return 1000.0 * kmode->htotal * kmode->vtotal / kmode->clock;
-}
-
-static double line_time(const drmModeModeInfo *kmode)
-{
-	return 1000.0 * kmode->htotal / kmode->clock;
-}
+#define frame_time(km) (1000.0 * (km)->htotal * (km)->vtotal / (km)->clock)
+#define line_time(km) (1000.0 * (km)->htotal / (km)->clock)
 
 static void check_timings(int crtc_idx, const drmModeModeInfo *kmode)
 {
@@ -541,6 +543,7 @@ static void test_crtc_config(const struct test_config *tconf,
 	struct crtc_config *crtc;
 	static int test_id;
 	bool config_failed = false;
+	bool retry = false;
 	int ret = 0;
 	int i;
 
@@ -550,6 +553,19 @@ static void test_crtc_config(const struct test_config *tconf,
 		return;
 
 	igt_info("  Test id#%d CRTC count %d\n", test_id, crtc_count);
+
+retry:
+	if (retry) {
+		kmstest_unset_all_crtcs(drm_fd, tconf->resources);
+
+		for (i = 0; i < crtc_count; i++) {
+			/* Sort the modes in asending order by clock freq. */
+			igt_sort_connector_modes(crtcs[i].cconfs->connector,
+						 sort_drm_modes_by_clk_asc);
+
+			crtcs[i].mode = crtcs[i].cconfs->connector->modes[0];
+		}
+	}
 
 	for (i = 0; i < crtc_count; i++) {
 		get_crtc_config_str(&crtcs[i], str_buf[i], sizeof(str_buf[i]));
@@ -583,6 +599,13 @@ static void test_crtc_config(const struct test_config *tconf,
 		free(ids);
 
 		if (ret < 0) {
+			if (errno == ENOSPC) {
+				igt_skip_on_f(retry, "No suitable mode(s) found to fit into the link BW.\n");
+
+				retry = true;
+				goto retry;
+			}
+
 			igt_assert_eq(errno, EINVAL);
 			config_failed = true;
 		}
@@ -596,6 +619,26 @@ static void test_crtc_config(const struct test_config *tconf,
 	return;
 }
 
+static int get_test_name_str(struct crtc_config *crtc, char *buf,
+				size_t buf_size)
+{
+	int pos;
+	int i;
+
+	pos = snprintf(buf, buf_size, "pipe-%s-", kmstest_pipe_name(crtc->pipe_id));
+
+	for (i = 0; i < crtc->connector_count; i++) {
+		drmModeConnector *connector = crtc->cconfs[i].connector;
+
+		pos += snprintf(&buf[pos], buf_size - pos,
+			"%s%s-%d", i ? "-" : "",
+			kmstest_connector_type_str(connector->connector_type),
+			connector->connector_type_id);
+	}
+
+	return pos;
+}
+
 static void test_one_combination(const struct test_config *tconf,
 				 struct connector_config *cconfs,
 				 int connector_count)
@@ -604,12 +647,46 @@ static void test_one_combination(const struct test_config *tconf,
 	int crtc_count;
 	bool config_valid;
 
-	setup_crtcs(tconf->resources, cconfs, connector_count, crtcs,
+	setup_crtcs(tconf, cconfs, connector_count, crtcs,
 		    &crtc_count, &config_valid);
 
-	if (config_valid == !(tconf->flags & TEST_INVALID))
-		test_crtc_config(tconf, crtcs, crtc_count);
+	if (config_valid == !(tconf->flags & TEST_INVALID)) {
+		int i, pos = 0;
+		char test_name[256];
 
+		for (i = 0; i < crtc_count; i++) {
+			if (i > 0)
+				pos += snprintf(&test_name[pos], ARRAY_SIZE(test_name) - pos, "-");
+			pos += get_test_name_str(&crtcs[i], &test_name[pos], ARRAY_SIZE(test_name) - pos);
+		}
+
+		for (i = 0; i < crtc_count; i++) {
+			struct crtc_config *crtc = &crtcs[i];
+
+			/*
+			 * if mode.hdisplay > 5120, then ignore
+			 *   - last crtc in single/multi-connector config
+			 *   - consecutive crtcs in multi-connector config
+			 *
+			 * in multi-connector config ignore if
+			 *   - previous crtc mode.hdisplay > 5120 and
+			 *   - current & previous crtcs are consecutive
+			 */
+			if (((crtc->mode.hdisplay > MAX_HDISPLAY_PER_CRTC) &&
+			     ((crtc->crtc_idx >= (tconf->resources->count_crtcs - 1)) ||
+			      ((i < (crtc_count - 1)) && (abs(crtcs[i + 1].crtc_idx - crtc->crtc_idx) <= 1)))) ||
+			    ((i > 0) && (crtc[i - 1].mode.hdisplay > MAX_HDISPLAY_PER_CRTC) &&
+			     (abs(crtc->crtc_idx - crtcs[i - 1].crtc_idx) <= 1))) {
+				igt_info("Combo: %s is not possible with selected mode(s).\n", test_name);
+				goto out;
+			}
+		}
+
+		igt_dynamic_f("%s", test_name)
+			test_crtc_config(tconf, crtcs, crtc_count);
+	}
+
+out:
 	cleanup_crtcs(crtcs, crtc_count);
 }
 
@@ -628,7 +705,7 @@ static int assign_crtc_to_connectors(const struct test_config *tconf,
 		    crtc_idx_mask & ~(1 << crtc_idx))
 			return -1;
 
-		if ((tconf->flags & TEST_EXCLUSIVE_CRTC_CLONE) &&
+		if ((tconf->flags & (TEST_EXCLUSIVE_CRTC_CLONE | TEST_TIMINGS)) &&
 		    crtc_idx_mask & (1 << crtc_idx))
 			return -1;
 
@@ -744,6 +821,14 @@ static void get_combinations(int n, int k, bool allow_repetitions,
 	iterate_combinations(n, k, allow_repetitions, 0, 0, &comb, set);
 }
 
+static int get_crtc_count(int count_crtcs, bool extend)
+{
+	if ((count_crtcs <= CRTC_RESTRICT_CNT) || extend)
+		return count_crtcs;
+	else
+		return CRTC_RESTRICT_CNT;
+}
+
 static void test_combinations(const struct test_config *tconf,
 			      int connector_count)
 {
@@ -751,6 +836,7 @@ static void test_combinations(const struct test_config *tconf,
 	struct combination_set crtc_combs;
 	struct connector_config *cconfs;
 	int i;
+	int crtc_count = get_crtc_count(tconf->resources->count_crtcs, extended);
 
 	if (connector_count > 2 && (tconf->flags & TEST_STEALING))
 		return;
@@ -758,17 +844,15 @@ static void test_combinations(const struct test_config *tconf,
 	igt_assert(tconf->resources);
 
 	connector_combs.capacity = pow(tconf->resources->count_connectors,
-				       tconf->resources->count_crtcs + 1);
-	crtc_combs.capacity = pow(tconf->resources->count_crtcs,
-				  tconf->resources->count_crtcs + 1);
-
+				       crtc_count + 1);
+	crtc_combs.capacity = pow(crtc_count,
+				  crtc_count + 1);
 	connector_combs.items = malloc(connector_combs.capacity * sizeof(struct combination));
 	crtc_combs.items = malloc(crtc_combs.capacity * sizeof(struct combination));
 
 	get_combinations(tconf->resources->count_connectors, connector_count,
 			 false, &connector_combs);
-	get_combinations(tconf->resources->count_crtcs, connector_count,
-			 true, &crtc_combs);
+	get_combinations(crtc_count, connector_count, true, &crtc_combs);
 
 	igt_info("Testing: %s %d connector combinations\n", tconf->name,
 		 connector_count);
@@ -809,9 +893,10 @@ free_cconfs:
 static void run_test(const struct test_config *tconf)
 {
 	int connector_num;
+	int crtc_count = get_crtc_count(tconf->resources->count_crtcs, extended);
 
 	connector_num = tconf->flags & TEST_CLONE ? 2 : 1;
-	for (; connector_num <= tconf->resources->count_crtcs; connector_num++)
+	for (; connector_num <= crtc_count; connector_num++)
 		test_combinations(tconf, connector_num);
 }
 
@@ -820,6 +905,9 @@ static int opt_handler(int opt, int opt_index, void *data)
 	switch (opt) {
 	case 'd':
 		dry_run = true;
+		break;
+	case 'e':
+		extended = true;
 		break;
 	case 't':
 		filter_test_id = atoi(optarg);
@@ -833,9 +921,10 @@ static int opt_handler(int opt, int opt_index, void *data)
 
 const char *help_str =
 	"  -d\t\tDon't run any test, only print what would be done. (still needs DRM access)\n"
-	"  -t <test id>\tRun only the test with this id.";
+	"  -t <test id>\tRun only the test with this id\n"
+	"  -e \t\tExtend to run on all pipes. (By default tests will run on two pipes only)\n";
 
-igt_main_args("dt:", NULL, help_str, opt_handler, NULL)
+igt_main_args("det:", NULL, help_str, opt_handler, NULL)
 {
 	const struct {
 		enum test_flags flags;
@@ -868,7 +957,8 @@ igt_main_args("dt:", NULL, help_str, opt_handler, NULL)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(tests); i++) {
-		igt_subtest(tests[i].name) {
+		igt_describe("Tests the mode by iterating through all valid/invalid crtc/connector combinations");
+		igt_subtest_with_dynamic(tests[i].name) {
 			struct test_config tconf = {
 				.flags		= tests[i].flags,
 				.name		= tests[i].name,

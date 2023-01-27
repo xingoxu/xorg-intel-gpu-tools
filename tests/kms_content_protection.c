@@ -170,25 +170,19 @@ static void modeset_with_fb(const enum pipe pipe, igt_output_t *output,
 			    enum igt_commit_style s)
 {
 	igt_display_t *display = &data.display;
-	drmModeModeInfo mode;
+	drmModeModeInfo *mode;
 	igt_plane_t *primary;
 
-	igt_assert(kmstest_get_connector_default_mode(
-			display->drm_fd, output->config.connector, &mode));
-
-	igt_output_override_mode(output, &mode);
+	mode = igt_output_get_mode(output);
 	igt_output_set_pipe(output, pipe);
 
-	igt_create_color_fb(display->drm_fd, mode.hdisplay, mode.vdisplay,
-			    DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE,
-			    1.f, 0.f, 0.f, &data.red);
-	igt_create_color_fb(display->drm_fd, mode.hdisplay, mode.vdisplay,
-			    DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE,
-			    0.f, 1.f, 0.f, &data.green);
-
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
-	igt_display_commit2(display, s);
 	igt_plane_set_fb(primary, &data.red);
+	igt_fb_set_size(&data.red, primary, mode->hdisplay, mode->vdisplay);
+
+	igt_display_commit2(display, s);
+
+	igt_plane_set_fb(primary, &data.green);
 
 	/* Wait for Flip completion before starting the HDCP authentication */
 	commit_display_and_wait_for_flip(s);
@@ -302,6 +296,8 @@ static bool write_srm_as_fw(const __u8 *srm, int len)
 
 	fd = open("/lib/firmware/display_hdcp_srm.bin",
 		  O_WRONLY | O_CREAT, S_IRWXU);
+	igt_require_f(fd >= 0, "Cannot write SRM binary to /lib/firmware\n");
+
 	do {
 		ret = write(fd, srm + total, len - total);
 		if (ret < 0)
@@ -318,96 +314,68 @@ static bool write_srm_as_fw(const __u8 *srm, int len)
 }
 
 static void test_content_protection_on_output(igt_output_t *output,
+					      enum pipe pipe,
 					      enum igt_commit_style s,
 					      int content_type)
 {
 	igt_display_t *display = &data.display;
-	igt_plane_t *primary;
-	enum pipe pipe;
 	bool ret;
 
-	for_each_pipe(display, pipe) {
-		if (!igt_pipe_connector_valid(pipe, output))
-			continue;
+	test_cp_enable_with_retry(output, s, 3, content_type, false,
+				  false);
 
-		/*
-		 * If previous subtest of connector failed, pipe
-		 * attached to that connector is not released.
-		 * Because of that we have to choose the non
-		 * attached pipe for this subtest.
-		 */
-		if (!igt_pipe_is_free(display, pipe))
-			continue;
+	if (data.cp_tests & CP_TYPE_CHANGE) {
+		/* Type 1 -> Type 0 */
+		test_cp_enable_with_retry(output, s, 3,
+					  HDCP_CONTENT_TYPE_0, false,
+					  true);
+		/* Type 0 -> Type 1 */
+		test_cp_enable_with_retry(output, s, 3,
+					  content_type, false,
+					  true);
+	}
 
-		modeset_with_fb(pipe, output, s);
-		test_cp_enable_with_retry(output, s, 3, content_type, false,
-					  false);
+	if (data.cp_tests & CP_MEI_RELOAD) {
+		igt_assert_f(!igt_kmod_unload("mei_hdcp", 0),
+			     "mei_hdcp unload failed");
 
-		if (data.cp_tests & CP_TYPE_CHANGE) {
-			/* Type 1 -> Type 0 */
-			test_cp_enable_with_retry(output, s, 3,
-						  HDCP_CONTENT_TYPE_0, false,
-						  true);
-			/* Type 0 -> Type 1 */
-			test_cp_enable_with_retry(output, s, 3,
+		/* Expected to fail */
+		test_cp_enable_with_retry(output, s, 3,
+					  content_type, true, false);
+
+		igt_assert_f(!igt_kmod_load("mei_hdcp", NULL),
+			     "mei_hdcp load failed");
+
+		/* Expected to pass */
+		test_cp_enable_with_retry(output, s, 3,
+					  content_type, false, false);
+	}
+
+	if (data.cp_tests & CP_LIC)
+		test_cp_lic(output);
+
+	if (data.cp_tests & CP_DPMS) {
+		igt_pipe_set_prop_value(display, pipe,
+					IGT_CRTC_ACTIVE, 0);
+		igt_display_commit2(display, s);
+
+		igt_pipe_set_prop_value(display, pipe,
+					IGT_CRTC_ACTIVE, 1);
+		igt_display_commit2(display, s);
+
+		ret = wait_for_prop_value(output, CP_ENABLED,
+					  KERNEL_AUTH_TIME_ALLOWED_MSEC);
+		if (!ret)
+			test_cp_enable_with_retry(output, s, 2,
 						  content_type, false,
-						  true);
-		}
-
-		if (data.cp_tests & CP_MEI_RELOAD) {
-			igt_assert_f(!igt_kmod_unload("mei_hdcp", 0),
-				     "mei_hdcp unload failed");
-
-			/* Expected to fail */
-			test_cp_enable_with_retry(output, s, 3,
-						  content_type, true, false);
-
-			igt_assert_f(!igt_kmod_load("mei_hdcp", NULL),
-				     "mei_hdcp load failed");
-
-			/* Expected to pass */
-			test_cp_enable_with_retry(output, s, 3,
-						  content_type, false, false);
-		}
-
-		if (data.cp_tests & CP_LIC)
-			test_cp_lic(output);
-
-		if (data.cp_tests & CP_DPMS) {
-			igt_pipe_set_prop_value(display, pipe,
-						IGT_CRTC_ACTIVE, 0);
-			igt_display_commit2(display, s);
-
-			igt_pipe_set_prop_value(display, pipe,
-						IGT_CRTC_ACTIVE, 1);
-			igt_display_commit2(display, s);
-
-			ret = wait_for_prop_value(output, CP_ENABLED,
-						  KERNEL_AUTH_TIME_ALLOWED_MSEC);
-			if (!ret)
-				test_cp_enable_with_retry(output, s, 2,
-							  content_type, false,
-							  false);
-		}
-
-		test_cp_disable(output, s);
-		primary = igt_output_get_plane_type(output,
-						    DRM_PLANE_TYPE_PRIMARY);
-		igt_plane_set_fb(primary, NULL);
-		igt_output_set_pipe(output, PIPE_NONE);
-
-		/*
-		 * Testing a output with a pipe is enough for HDCP
-		 * testing. No ROI in testing the connector with other
-		 * pipes. So Break the loop on pipe.
-		 */
-		break;
+						  false);
 	}
 }
 
 static void __debugfs_read(int fd, const char *param, char *buf, int len)
 {
 	len = igt_debugfs_simple_read(fd, param, buf, len);
+	igt_require(len != -ENOENT);
 	if (len < 0)
 		igt_assert_eq(len, -ENODEV);
 }
@@ -458,42 +426,264 @@ static bool sink_hdcp2_capable(igt_output_t *output)
 	return strstr(buf, "HDCP2.2");
 }
 
+static void prepare_modeset_on_mst_output(igt_output_t *output)
+{
+	drmModeModeInfo *mode;
+	igt_plane_t *primary;
+	int width, height;
+	enum pipe pipe = output->pending_pipe;
+
+	mode = igt_output_get_mode(output);
+
+	width = mode->hdisplay;
+	height = mode->vdisplay;
+
+	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
+	igt_plane_set_fb(primary, NULL);
+	igt_plane_set_fb(primary, pipe % 2 ? &data.red : &data.green);
+	igt_fb_set_size(pipe % 2 ? &data.red : &data.green, primary, width, height);
+	igt_plane_set_size(primary, width, height);
+}
+
+static bool output_hdcp_capable(igt_output_t *output, int content_type)
+{
+		if (!output->props[IGT_CONNECTOR_CONTENT_PROTECTION])
+			return false;
+
+		if (!output->props[IGT_CONNECTOR_HDCP_CONTENT_TYPE] &&
+		    content_type)
+			return false;
+
+		if (content_type && !sink_hdcp2_capable(output)) {
+			igt_info("\tSkip %s (Sink has no HDCP2.2 support)\n",
+				 output->name);
+			return false;
+		} else if (!sink_hdcp_capable(output)) {
+			igt_info("\tSkip %s (Sink has no HDCP support)\n",
+				 output->name);
+			return false;
+		}
+
+		return true;
+}
+
+static void
+test_fini(igt_output_t *output, enum igt_commit_style s)
+{
+	igt_plane_t *primary;
+
+	test_cp_disable(output, s);
+	primary = igt_output_get_plane_type(output,
+					    DRM_PLANE_TYPE_PRIMARY);
+	igt_plane_set_fb(primary, NULL);
+	igt_output_set_pipe(output, PIPE_NONE);
+	igt_display_commit2(&data.display, s);
+}
+
 static void
 test_content_protection(enum igt_commit_style s, int content_type)
 {
 	igt_display_t *display = &data.display;
 	igt_output_t *output;
-	int valid_tests = 0;
+	enum pipe pipe;
 
 	if (data.cp_tests & CP_MEI_RELOAD)
 		igt_require_f(igt_kmod_is_loaded("mei_hdcp"),
 			      "mei_hdcp module is not loaded\n");
 
-	for_each_connected_output(display, output) {
-		if (!output->props[IGT_CONNECTOR_CONTENT_PROTECTION])
-			continue;
-
-		if (!output->props[IGT_CONNECTOR_HDCP_CONTENT_TYPE] &&
-		    content_type)
-			continue;
-
-		igt_info("CP Test execution on %s\n", output->name);
-
-		if (content_type && !sink_hdcp2_capable(output)) {
-			igt_info("\tSkip %s (Sink has no HDCP2.2 support)\n",
-				 output->name);
-			continue;
-		} else if (!sink_hdcp_capable(output)) {
-			igt_info("\tSkip %s (Sink has no HDCP support)\n",
-				 output->name);
-			continue;
-		}
-
-		test_content_protection_on_output(output, s, content_type);
-		valid_tests++;
+	if (data.cp_tests & CP_UEVENT) {
+		data.uevent_monitor = igt_watch_uevents();
+		igt_flush_uevents(data.uevent_monitor);
 	}
 
-	igt_require_f(valid_tests, "No connector found with HDCP capability\n");
+	for_each_connected_output(display, output) {
+		for_each_pipe(display, pipe) {
+			if (!igt_pipe_connector_valid(pipe, output))
+				continue;
+
+			igt_display_reset(display);
+			modeset_with_fb(pipe, output, s);
+
+			if (!output_hdcp_capable(output, content_type))
+				continue;
+
+			igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), output->name)
+				test_content_protection_on_output(output, pipe, s, content_type);
+
+			test_fini(output, s);
+			/*
+			 * Testing a output with a pipe is enough for HDCP
+			 * testing. No ROI in testing the connector with other
+			 * pipes. So Break the loop on pipe.
+			 */
+			break;
+		}
+	}
+
+	if (data.cp_tests & CP_UEVENT)
+		igt_cleanup_uevents(data.uevent_monitor);
+}
+
+static int parse_path_blob(char *blob_data)
+{
+	int connector_id;
+	char *encoder;
+
+	encoder = strtok(blob_data, ":");
+	igt_assert_f(!strcmp(encoder, "mst"), "PATH connector property expected to have 'mst'\n");
+
+	connector_id = atoi(strtok(NULL, "-"));
+
+	return connector_id;
+}
+
+static bool output_is_dp_mst(igt_output_t *output, int i)
+{
+	drmModePropertyBlobPtr path_blob = NULL;
+	uint64_t path_blob_id;
+	drmModeConnector *connector = output->config.connector;
+	struct kmstest_connector_config config;
+	const char *encoder;
+	int connector_id;
+	static int prev_connector_id;
+
+	kmstest_get_connector_config(data.drm_fd, output->config.connector->connector_id, -1, &config);
+	encoder = kmstest_encoder_type_str(config.encoder->encoder_type);
+
+	if (strcmp(encoder, "DP MST"))
+		return false;
+
+	igt_assert(kmstest_get_property(data.drm_fd, connector->connector_id,
+		   DRM_MODE_OBJECT_CONNECTOR, "PATH", NULL,
+		   &path_blob_id, NULL));
+
+	igt_assert(path_blob = drmModeGetPropertyBlob(data.drm_fd, path_blob_id));
+
+	connector_id = parse_path_blob((char *) path_blob->data);
+
+	/*
+	 * Discarding outputs of other DP MST topology.
+	 * Testing only on outputs on the topology we got previously
+	 */
+	if (i == 0) {
+		prev_connector_id = connector_id;
+	} else {
+		if (connector_id != prev_connector_id)
+			return false;
+	}
+
+	drmModeFreePropertyBlob(path_blob);
+
+	return true;
+}
+
+static void test_cp_lic_on_mst(igt_output_t *mst_outputs[], int valid_outputs, bool first_output)
+{
+	int ret, count;
+	uint64_t val;
+
+	/* Only wait for the first output, this optimizes the test execution time */
+	ret = wait_for_prop_value(mst_outputs[first_output], CP_DESIRED, LIC_PERIOD_MSEC);
+	igt_assert_f(!ret, "Content Protection LIC Failed on %s\n", mst_outputs[0]->name);
+
+	for (count = first_output + 1; count < valid_outputs; count++) {
+		val = igt_output_get_prop(mst_outputs[count], IGT_CONNECTOR_CONTENT_PROTECTION);
+		igt_assert_f(val != CP_DESIRED, "Content Protection LIC Failed on %s\n", mst_outputs[count]->name);
+	}
+}
+
+static void
+test_content_protection_mst(int content_type)
+{
+	igt_display_t *display = &data.display;
+	igt_output_t *output;
+	int valid_outputs = 0, dp_mst_outputs = 0, ret, count, max_pipe = 0, i;
+	enum pipe pipe;
+	bool pipe_found;
+	igt_output_t *mst_output[IGT_MAX_PIPES], *hdcp_mst_output[IGT_MAX_PIPES];
+
+	for_each_pipe(display, pipe)
+		max_pipe++;
+
+	pipe = PIPE_A;
+
+	for_each_connected_output(display, output) {
+		if (!output_is_dp_mst(output, dp_mst_outputs))
+			continue;
+
+		pipe_found = false;
+		for_each_pipe(display, pipe) {
+			if (igt_pipe_is_free(display, pipe) &&
+			    igt_pipe_connector_valid(pipe, output)) {
+				pipe_found = true;
+				break;
+			}
+		}
+
+		igt_assert_f(pipe_found, "No valid pipe found for %s\n", output->name);
+
+		igt_output_set_pipe(output, pipe);
+		prepare_modeset_on_mst_output(output);
+		mst_output[dp_mst_outputs++] = output;
+	}
+
+	igt_require_f(dp_mst_outputs > 1, "No DP MST set up with >= 2 outputs found in a single topology\n");
+
+	if (igt_display_try_commit_atomic(display,
+				DRM_MODE_ATOMIC_TEST_ONLY |
+				DRM_MODE_ATOMIC_ALLOW_MODESET,
+				NULL) != 0) {
+		bool found = igt_override_all_active_output_modes_to_fit_bw(display);
+		igt_require_f(found, "No valid mode combo found for MST modeset\n");
+
+		for (count = 0; count < dp_mst_outputs; count++)
+			prepare_modeset_on_mst_output(mst_output[count]);
+	}
+
+	ret = igt_display_try_commit2(display, COMMIT_ATOMIC);
+	igt_require_f(ret == 0, "Commit failure during MST modeset\n");
+
+	for (count = 0; count < dp_mst_outputs; count++) {
+		if (!output_hdcp_capable(mst_output[count], content_type))
+			continue;
+
+		hdcp_mst_output[valid_outputs++] = mst_output[count];
+	}
+
+	igt_require_f(valid_outputs > 1, "DP MST outputs do not have the required HDCP support\n");
+
+	for (count = 0; count < valid_outputs; count++) {
+		igt_output_set_prop_value(hdcp_mst_output[count], IGT_CONNECTOR_CONTENT_PROTECTION, CP_DESIRED);
+
+		if (output->props[IGT_CONNECTOR_HDCP_CONTENT_TYPE])
+			igt_output_set_prop_value(hdcp_mst_output[count], IGT_CONNECTOR_HDCP_CONTENT_TYPE, content_type);
+	}
+
+	igt_display_commit2(display, COMMIT_ATOMIC);
+
+	for (count = 0; count < valid_outputs; count++) {
+		ret = wait_for_prop_value(hdcp_mst_output[count], CP_ENABLED, KERNEL_AUTH_TIME_ALLOWED_MSEC);
+		igt_assert_f(ret, "Content Protection not enabled on %s\n", hdcp_mst_output[count]->name);
+	}
+
+	if (data.cp_tests & CP_LIC)
+		test_cp_lic_on_mst(hdcp_mst_output, valid_outputs, 0);
+
+	/*
+	 * Verify if CP is still enabled on other outputs by disabling CP on the first output.
+	 */
+	igt_debug("CP Prop being UNDESIRED on %s\n", hdcp_mst_output[0]->name);
+	test_cp_disable(hdcp_mst_output[0], COMMIT_ATOMIC);
+
+	/* CP is expected to be still enabled on other outputs*/
+	for (i = 1; i < valid_outputs; i++) {
+		/* Wait for the timeout to verify CP is not disabled */
+		ret = wait_for_prop_value(hdcp_mst_output[i], CP_UNDESIRED, KERNEL_DISABLE_TIME_ALLOWED_MSEC);
+		igt_assert_f(!ret, "Content Protection not enabled on %s\n", hdcp_mst_output[i]->name);
+	}
+
+	if (data.cp_tests & CP_LIC)
+		test_cp_lic_on_mst(hdcp_mst_output, valid_outputs, 1);
 }
 
 static void test_content_protection_cleanup(void)
@@ -512,67 +702,79 @@ static void test_content_protection_cleanup(void)
 			continue;
 
 		igt_info("CP Prop being UNDESIRED on %s\n", output->name);
-		test_cp_disable(output, COMMIT_ATOMIC);
+		test_cp_disable(output, display->is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
 	}
+
+	igt_remove_fb(data.drm_fd, &data.red);
+	igt_remove_fb(data.drm_fd, &data.green);
 }
 
-igt_main
+static void create_fbs(void)
 {
-	igt_fixture {
-		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
+	uint16_t width = 0, height = 0;
+	drmModeModeInfo *mode;
+	igt_output_t *output;
 
-		igt_display_require(&data.display, data.drm_fd);
+	for_each_connected_output(&data.display, output) {
+		mode = igt_output_get_mode(output);
+		igt_assert(mode);
+
+		width = max(width, mode->hdisplay);
+		height = max(height, mode->vdisplay);
 	}
 
-	igt_subtest("legacy") {
-		data.cp_tests = 0;
-		test_content_protection(COMMIT_LEGACY, HDCP_CONTENT_TYPE_0);
-	}
+	igt_create_color_fb(data.drm_fd, width, height,
+			    DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
+			    1.f, 0.f, 0.f, &data.red);
+	igt_create_color_fb(data.drm_fd, width, height,
+			    DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
+			    0.f, 1.f, 0.f, &data.green);
+}
 
-	igt_subtest("atomic") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = 0;
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_0);
-	}
-
-	igt_subtest("atomic-dpms") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = CP_DPMS;
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_0);
-	}
-
-	igt_subtest("LIC") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = CP_LIC;
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_0);
-	}
-
-	igt_subtest("type1") {
-		igt_require(data.display.is_atomic);
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_1);
-	}
-
-	igt_subtest("mei_interface") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = CP_MEI_RELOAD;
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_1);
-	}
-
-	igt_subtest("content_type_change") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = CP_TYPE_CHANGE;
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_1);
-	}
-
-	igt_subtest("uevent") {
-		igt_require(data.display.is_atomic);
-		data.cp_tests = CP_UEVENT;
-		data.uevent_monitor = igt_watch_uevents();
-		igt_flush_uevents(data.uevent_monitor);
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_0);
-		igt_cleanup_uevents(data.uevent_monitor);
-	}
-
+static const struct {
+	const char *desc;
+	const char *name;
+	unsigned int cp_tests;
+	bool content_type;
+} subtests[] = {
+	{ .desc = "Test content protection with atomic modesetting",
+	  .name = "atomic",
+	  .cp_tests = 0,
+	  .content_type = HDCP_CONTENT_TYPE_0
+	},
+	{ .desc = "Test content protection with DPMS ON/OFF during atomic modesetting.",
+	  .name = "atomic-dpms",
+	  .cp_tests = CP_DPMS,
+	  .content_type = HDCP_CONTENT_TYPE_0
+	},
+	{ .desc = "Test for the integrity of link.",
+	  .name = "LIC",
+	  .cp_tests = CP_LIC,
+	  .content_type = HDCP_CONTENT_TYPE_0,
+	},
+	{ .desc = "Test content protection with content type 1 "
+		  "that can be handled only through HDCP2.2.",
+	  .name = "type1",
+	  .cp_tests = 0,
+	  .content_type = HDCP_CONTENT_TYPE_1,
+	},
+	{ .desc = "Test the teardown and rebuild of the interface between "
+		  "I915 and mei hdcp.",
+	  .name = "mei_interface",
+	  .cp_tests = CP_MEI_RELOAD,
+	  .content_type = HDCP_CONTENT_TYPE_1,
+	},
+	{ .desc = "Test the content type change when the content protection already enabled",
+	  .name = "content_type_change",
+	  .cp_tests = CP_TYPE_CHANGE,
+	  .content_type = HDCP_CONTENT_TYPE_1,
+	},
+	{ .desc = "Test to detect the HDCP status change when we are reading the uevent "
+		  "sent with the corresponding connector id and property id.",
+	  .name = "uevent",
+	  .cp_tests = CP_UEVENT,
+	  .content_type = HDCP_CONTENT_TYPE_0,
+	},
 	/*
 	 *  Testing the revocation check through SRM needs a HDCP sink with
 	 *  programmable Ksvs or we need a uAPI from kernel to read the
@@ -581,19 +783,97 @@ igt_main
 	 *  either of these options, we test SRM writing from userspace and
 	 *  validation of the same at kernel. Something is better than nothing.
 	 */
-	igt_subtest("srm") {
-		bool ret;
+	{ .desc = "This test writes the facsimile SRM into the /lib/firmware/ "
+		  "and check the kernel parsing of it by invoking the hdcp authentication.",
+	  .name = "srm",
+	  .cp_tests = 0,
+	  .content_type = HDCP_CONTENT_TYPE_0,
+	},
+};
 
-		igt_require(data.display.is_atomic);
+static const struct {
+	const char *desc;
+	const char *name;
+	unsigned int cp_tests;
+	bool content_type;
+} mst_subtests[] = {
+	{ .desc = "Test Content protection(Type 0) over DP MST.",
+	  .name = "dp-mst-type-0",
+	  .cp_tests = 0,
+	  .content_type = HDCP_CONTENT_TYPE_0
+	},
+	{ .desc = "Test Content protection(Type 0) over DP MST with LIC.",
+	  .name = "dp-mst-lic-type-0",
+	  .cp_tests = CP_LIC,
+	  .content_type = HDCP_CONTENT_TYPE_0
+	},
+	{ .desc = "Test Content protection(Type 1) over DP MST.",
+	  .name = "dp-mst-type-1",
+	  .cp_tests = 0,
+	  .content_type = HDCP_CONTENT_TYPE_1,
+	},
+	{ .desc = "Test Content protection(Type 1) over DP MST with LIC.",
+	  .name = "dp-mst-lic-type-1",
+	  .cp_tests = CP_LIC,
+	  .content_type = HDCP_CONTENT_TYPE_1,
+	},
+};
+
+igt_main
+{
+	igt_fixture {
+		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
+		igt_display_require(&data.display, data.drm_fd);
+		igt_display_require_output(&data.display);
+		create_fbs();
+	}
+
+	igt_describe("Test content protection with legacy style commit.");
+	igt_subtest_with_dynamic("legacy") {
 		data.cp_tests = 0;
-		ret = write_srm_as_fw((const __u8 *)facsimile_srm,
-				      sizeof(facsimile_srm));
-		igt_assert_f(ret, "SRM update failed");
-		test_content_protection(COMMIT_ATOMIC, HDCP_CONTENT_TYPE_0);
+		test_content_protection(COMMIT_LEGACY, HDCP_CONTENT_TYPE_0);
+	}
+
+	igt_subtest_group {
+		igt_fixture
+			igt_require(data.display.is_atomic);
+
+		for (int i = 0; i < ARRAY_SIZE(subtests); i++) {
+			igt_describe_f("%s", subtests[i].desc);
+
+			igt_subtest_with_dynamic(subtests[i].name) {
+				data.cp_tests = subtests[i].cp_tests;
+
+				if (!strcmp(subtests[i].name, "srm")) {
+					bool ret;
+
+					ret = write_srm_as_fw((const __u8 *)facsimile_srm,
+							     sizeof(facsimile_srm));
+					igt_assert_f(ret, "SRM update failed");
+				}
+
+				test_content_protection(COMMIT_ATOMIC, subtests[i].content_type);
+			}
+		}
+	}
+
+	igt_subtest_group {
+		igt_fixture
+			igt_require(data.display.is_atomic);
+
+		for (int i = 0; i < ARRAY_SIZE(mst_subtests); i++) {
+			igt_describe_f("%s", mst_subtests[i].desc);
+
+			igt_subtest(mst_subtests[i].name) {
+				data.cp_tests = mst_subtests[i].cp_tests;
+				test_content_protection_mst(mst_subtests[i].content_type);
+			}
+		}
 	}
 
 	igt_fixture {
 		test_content_protection_cleanup();
 		igt_display_fini(&data.display);
+		close(data.drm_fd);
 	}
 }

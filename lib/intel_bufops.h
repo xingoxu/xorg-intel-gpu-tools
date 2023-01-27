@@ -2,6 +2,7 @@
 #define __INTEL_BUFOPS_H__
 
 #include <stdint.h>
+#include "igt_list.h"
 #include "igt_aux.h"
 #include "intel_batchbuffer.h"
 
@@ -9,10 +10,14 @@ struct buf_ops;
 
 #define INTEL_BUF_INVALID_ADDRESS (-1ull)
 #define INTEL_BUF_NAME_MAXSIZE 32
+#define INVALID_ADDR(x) ((x) == INTEL_BUF_INVALID_ADDRESS)
+
 struct intel_buf {
 	struct buf_ops *bops;
+
 	bool is_owner;
 	uint32_t handle;
+	uint64_t size;
 	uint32_t tiling;
 	uint32_t bpp;
 	uint32_t compression;
@@ -23,7 +28,7 @@ struct intel_buf {
 	struct {
 		uint32_t offset;
 		uint32_t stride;
-		uint32_t size;
+		uint64_t size;
 	} surface[2];
 	struct {
 		uint32_t offset;
@@ -37,9 +42,18 @@ struct intel_buf {
 		uint32_t ctx;
 	} addr;
 
+	uint64_t bo_size;
+
+	/* Tracking */
+	struct intel_bb *ibb;
+	struct igt_list_head link;
+
 	/* CPU mapping */
 	uint32_t *ptr;
 	bool cpu_write;
+
+	/* Content Protection*/
+	bool is_protected;
 
 	/* For debugging purposes */
 	char name[INTEL_BUF_NAME_MAXSIZE + 1];
@@ -69,7 +83,7 @@ intel_buf_ccs_width(int gen, const struct intel_buf *buf)
 	 * main surface.
 	 */
 	if (gen >= 12)
-		return DIV_ROUND_UP(intel_buf_width(buf), 128) * 64;
+		return DIV_ROUND_UP(intel_buf_width(buf), 512 / (buf->bpp / 8)) * 64;
 
 	return DIV_ROUND_UP(intel_buf_width(buf), 1024) * 128;
 }
@@ -88,7 +102,8 @@ intel_buf_ccs_height(int gen, const struct intel_buf *buf)
 	return DIV_ROUND_UP(intel_buf_height(buf), 512) * 32;
 }
 
-uint32_t intel_buf_bo_size(const struct intel_buf *buf);
+uint64_t intel_buf_size(const struct intel_buf *buf);
+uint64_t intel_buf_bo_size(const struct intel_buf *buf);
 
 struct buf_ops *buf_ops_create(int fd);
 struct buf_ops *buf_ops_create_with_selftest(int fd);
@@ -116,6 +131,11 @@ static inline void intel_buf_set_ownership(struct intel_buf *buf, bool is_owner)
 void intel_buf_init(struct buf_ops *bops, struct intel_buf *buf,
 		    int width, int height, int bpp, int alignment,
 		    uint32_t tiling, uint32_t compression);
+void intel_buf_init_in_region(struct buf_ops *bops,
+			      struct intel_buf *buf,
+			      int width, int height, int bpp, int alignment,
+			      uint32_t tiling, uint32_t compression,
+			      uint32_t region);
 void intel_buf_close(struct buf_ops *bops, struct intel_buf *buf);
 
 void intel_buf_init_using_handle(struct buf_ops *bops,
@@ -136,7 +156,27 @@ struct intel_buf *intel_buf_create_using_handle(struct buf_ops *bops,
 						uint32_t req_tiling,
 						uint32_t compression);
 
+struct intel_buf *intel_buf_create_using_handle_and_size(struct buf_ops *bops,
+							 uint32_t handle,
+							 int width, int height,
+							 int bpp, int alignment,
+							 uint32_t req_tiling,
+							 uint32_t compression,
+							 uint64_t size,
+							 int stride);
 void intel_buf_destroy(struct intel_buf *buf);
+
+static inline void intel_buf_set_pxp(struct intel_buf *buf, bool new_pxp_state)
+{
+	igt_assert(buf);
+	buf->is_protected = new_pxp_state;
+}
+
+static inline bool intel_buf_pxp(const struct intel_buf *buf)
+{
+	igt_assert(buf);
+	return buf->is_protected;
+}
 
 void *intel_buf_cpu_map(struct intel_buf *buf, bool write);
 void *intel_buf_device_map(struct intel_buf *buf, bool write);

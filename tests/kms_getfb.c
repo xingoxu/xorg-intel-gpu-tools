@@ -37,9 +37,10 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+
 #include "drm.h"
 #include "drm_fourcc.h"
-
+#include "i915/gem_create.h"
 #include "igt_device.h"
 
 IGT_TEST_DESCRIPTION("Tests GETFB and GETFB2 ioctls.");
@@ -87,11 +88,18 @@ static void get_ccs_fb(int fd, struct drm_mode_fb_cmd2 *ret)
 		.flags = DRM_MODE_FB_MODIFIERS,
 	};
 	int size;
+	uint32_t devid;
 
 	igt_require(has_addfb2_iface(fd));
 	igt_require_intel(fd);
+	devid = intel_get_drm_devid(fd);
 
-	if ((intel_gen(intel_get_drm_devid(fd))) >= 12) {
+	if (HAS_FLATCCS(devid)) {
+		add.modifier[0] = I915_FORMAT_MOD_4_TILED_DG2_RC_CCS;
+		add.pitches[0] = ALIGN(add.width * 4, 4 * 512);
+		size = add.pitches[0] * ALIGN(add.height, 8);
+		size = ALIGN(size, 4096);
+	} else if ((intel_display_ver(devid)) >= 12) {
 		add.modifier[0] = I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS;
 		add.modifier[1] = I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS;
 
@@ -127,9 +135,11 @@ static void get_ccs_fb(int fd, struct drm_mode_fb_cmd2 *ret)
 		size += add.pitches[1] * ALIGN(ALIGN(add.height, 16) / 16, 32);
 	}
 
-	add.handles[0] = gem_create(fd, size);
+	add.handles[0] = gem_buffer_create_fb_obj(fd, size);
 	igt_require(add.handles[0] != 0);
-	add.handles[1] = add.handles[0];
+
+	if (!HAS_FLATCCS(intel_get_drm_devid(fd)))
+		add.handles[1] = add.handles[0];
 
 	if (drmIoctl(fd, DRM_IOCTL_MODE_ADDFB2, &add) == 0)
 		*ret = add;
@@ -169,11 +179,14 @@ static void test_handle_input(int fd)
 		do_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &add);
 	}
 
+	igt_describe("Tests error handling for a zero'd input.");
 	igt_subtest("getfb-handle-zero") {
 		struct drm_mode_fb_cmd get = { .fb_id = 0 };
 		do_ioctl_err(fd, DRM_IOCTL_MODE_GETFB, &get, ENOENT);
 	}
 
+	igt_describe("Tests error handling when passing an valid "
+		     "handle.");
 	igt_subtest("getfb-handle-valid") {
 		struct drm_mode_fb_cmd get = { .fb_id = add.fb_id };
 		do_ioctl(fd, DRM_IOCTL_MODE_GETFB, &get);
@@ -186,12 +199,16 @@ static void test_handle_input(int fd)
 		gem_close(fd, get.handle);
 	}
 
+	igt_describe("Tests error handling when passing a handle that "
+		     "has been closed.");
 	igt_subtest("getfb-handle-closed") {
 		struct drm_mode_fb_cmd get = { .fb_id = add.fb_id };
 		do_ioctl(fd, DRM_IOCTL_MODE_RMFB, &add.fb_id);
 		do_ioctl_err(fd, DRM_IOCTL_MODE_GETFB, &get, ENOENT);
 	}
 
+	igt_describe("Tests error handling when passing an invalid "
+		     "handle.");
 	igt_subtest("getfb-handle-not-fb") {
 		struct drm_mode_fb_cmd get = { .fb_id = get_any_prop_id(fd) };
 		igt_require(get.fb_id > 0);
@@ -217,6 +234,8 @@ static void test_duplicate_handles(int fd)
 		do_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &add);
 	}
 
+	igt_describe("Tests error handling while requesting for two different "
+		     "handles from same fd.");
 	igt_subtest("getfb-addfb-different-handles") {
 		struct drm_mode_fb_cmd get = { .fb_id = add.fb_id };
 
@@ -225,6 +244,8 @@ static void test_duplicate_handles(int fd)
 		gem_close(fd, get.handle);
 	}
 
+	igt_describe("Tests error handling while requesting for two different "
+		     "handles from different fd.");
 	igt_subtest("getfb-repeated-different-handles") {
 		struct drm_mode_fb_cmd get1 = { .fb_id = add.fb_id };
 		struct drm_mode_fb_cmd get2 = { .fb_id = add.fb_id };
@@ -237,9 +258,16 @@ static void test_duplicate_handles(int fd)
 		gem_close(fd, get2.handle);
 	}
 
+	igt_describe("Tests error handling while requesting CCS buffers "
+		     "it should refuse because getfb supports returning "
+		     "a single buffer handle.");
 	igt_subtest("getfb-reject-ccs") {
 		struct drm_mode_fb_cmd2 add_ccs = { };
 		struct drm_mode_fb_cmd get = { };
+
+		igt_require(is_i915_device(fd));
+		igt_require_f(!HAS_FLATCCS(intel_get_drm_devid(fd)),
+			      "skip because flat ccs has only one buffer.\n");
 
 		get_ccs_fb(fd, &add_ccs);
 		igt_require(add_ccs.handles[0] != 0);
@@ -335,7 +363,9 @@ static void test_getfb2(int fd)
 				igt_assert_eq_u64(get.modifier[i], 0);
 			}
 		}
-		igt_assert_eq_u32(get.handles[0], get.handles[1]);
+
+		if (!HAS_FLATCCS(intel_get_drm_devid(fd)))
+			igt_assert_eq_u32(get.handles[0], get.handles[1]);
 
 		do_ioctl(fd, DRM_IOCTL_MODE_RMFB, &get.fb_id);
 		gem_close(fd, add_ccs.handles[0]);

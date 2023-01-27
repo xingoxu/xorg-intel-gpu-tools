@@ -45,8 +45,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
-#include "drm.h"
 
+#include "drm.h"
+#include "i915/gem_create.h"
 
 IGT_TEST_DESCRIPTION("Test pread behavior on tiled objects with respect to the"
 		     " reported swizzling value.");
@@ -127,6 +128,7 @@ igt_simple_main
 	igt_require(gem_available_fences(fd) > 0);
 	handle = create_bo(fd);
 	igt_require(gem_get_tiling(fd, handle, &tiling, &swizzle));
+	gem_require_pread_pwrite(fd);
 
 	devid = intel_get_drm_devid(fd);
 

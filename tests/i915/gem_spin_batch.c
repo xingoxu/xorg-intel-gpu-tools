@@ -23,6 +23,7 @@
  */
 
 #include "i915/gem.h"
+#include "i915/gem_ring.h"
 #include "igt.h"
 
 #define MAX_ERROR 5 /* % */
@@ -33,8 +34,8 @@
 		     "'%s' != '%s' (%lld not within %d%% tolerance of %lld)\n",\
 		     #x, #ref, (long long)x, tolerance, (long long)ref)
 
-static void spin(int fd,
-		 const struct intel_execution_engine2 *e2,
+static void spin(int fd, const intel_ctx_t *ctx_id,
+		 unsigned int engine,
 		 unsigned int flags,
 		 unsigned int timeout_sec)
 {
@@ -44,11 +45,14 @@ static void spin(int fd,
 	struct timespec tv = { };
 	struct timespec itv = { };
 	uint64_t elapsed;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx_id->id);
 
-	spin = __igt_spin_new(fd, .engine = e2->flags, .flags = flags);
+	spin = __igt_spin_new(fd, .ahnd = ahnd, .ctx = ctx_id,
+			      .engine = engine, .flags = flags);
 	while ((elapsed = igt_nsec_elapsed(&tv)) >> 30 < timeout_sec) {
 		igt_spin_t *next =
-			__igt_spin_new(fd, .engine = e2->flags, .flags = flags);
+			__igt_spin_new(fd, .ahnd = ahnd, .ctx = ctx_id,
+				       .engine = engine, .flags = flags);
 
 		igt_spin_set_timeout(spin,
 				     timeout_100ms - igt_nsec_elapsed(&itv));
@@ -57,13 +61,14 @@ static void spin(int fd,
 			  loops,
 			  igt_nsec_elapsed(&itv) * 1e-6,
 			  igt_nsec_elapsed(&tv) * 1e-6);
-		memset(&itv, 0, sizeof(itv));
+		igt_nsec_elapsed(memset(&itv, 0, sizeof(itv)));
 
 		igt_spin_free(fd, spin);
 		spin = next;
 		loops++;
 	}
 	igt_spin_free(fd, spin);
+	put_ahnd(ahnd);
 
 	igt_info("Completed %ld loops in %lld ns, target %ld\n",
 		 loops, (long long)elapsed, (long)(elapsed / timeout_100ms));
@@ -74,48 +79,41 @@ static void spin(int fd,
 #define RESUBMIT_NEW_CTX     (1 << 0)
 #define RESUBMIT_ALL_ENGINES (1 << 1)
 
-static void spin_resubmit(int fd, const struct intel_execution_engine2 *e2,
-			  unsigned int flags)
+static void spin_resubmit(int fd, const intel_ctx_t *ctx,
+			  unsigned int engine, unsigned int flags)
 {
-	const uint32_t ctx0 = gem_context_clone_with_engines(fd, 0);
-	const uint32_t ctx1 =
-		(flags & RESUBMIT_NEW_CTX) ?
-		gem_context_clone_with_engines(fd, 0) : ctx0;
-	igt_spin_t *spin = __igt_spin_new(fd, .ctx = ctx0, .engine = e2->flags);
-	const struct intel_execution_engine2 *other;
+	const intel_ctx_t *new_ctx = NULL;
+	igt_spin_t *spin;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
-	struct drm_i915_gem_execbuffer2 eb = {
-		.buffer_count = 1,
-		.buffers_ptr = to_user_pointer(&spin->obj[IGT_SPIN_BATCH]),
-		.rsvd1 = ctx1,
-	};
+	if (flags & RESUBMIT_NEW_CTX)
+		igt_require(gem_has_contexts(fd));
 
-	igt_assert(gem_context_has_engine_map(fd, 0) ||
-		   !(flags & RESUBMIT_ALL_ENGINES));
-
-	if (flags & RESUBMIT_ALL_ENGINES) {
-		for_each_context_engine(fd, ctx1, other) {
-			if (gem_engine_is_equal(other, e2))
-				continue;
-
-			eb.flags = other->flags;
-			gem_execbuf(fd, &eb);
-		}
-	} else {
-		eb.flags = e2->flags;
-		gem_execbuf(fd, &eb);
+	spin = __igt_spin_new(fd, .ahnd = ahnd, .ctx = ctx, .engine = engine);
+	if (flags & RESUBMIT_NEW_CTX) {
+		new_ctx = intel_ctx_create(fd, &ctx->cfg);
+		spin->execbuf.rsvd1 = new_ctx->id;
 	}
 
-	igt_spin_end(spin);
+	if (flags & RESUBMIT_ALL_ENGINES) {
+		const struct intel_execution_engine2 *other;
 
+		for_each_ctx_engine(fd, ctx, other) {
+			spin->execbuf.flags &= ~0x3f;
+			spin->execbuf.flags |= other->flags;
+			gem_execbuf(fd, &spin->execbuf);
+		}
+	}
+
+	gem_execbuf(fd, &spin->execbuf);
+	igt_spin_end(spin);
 	gem_sync(fd, spin->handle);
 
+	if (flags & RESUBMIT_NEW_CTX)
+		intel_ctx_destroy(fd, new_ctx);
+
 	igt_spin_free(fd, spin);
-
-	if (ctx1 != ctx0)
-		gem_context_destroy(fd, ctx1);
-
-	gem_context_destroy(fd, ctx0);
+	put_ahnd(ahnd);
 }
 
 static void spin_exit_handler(int sig)
@@ -124,41 +122,45 @@ static void spin_exit_handler(int sig)
 }
 
 static void
-spin_on_all_engines(int fd, unsigned long flags, unsigned int timeout_sec)
+spin_on_all_engines(int fd, const intel_ctx_t *ctx,
+		    unsigned long flags, unsigned int timeout_sec)
 {
 	const struct intel_execution_engine2 *e2;
 
-	__for_each_physical_engine(fd, e2) {
+	for_each_ctx_engine(fd, ctx, e2) {
 		igt_fork(child, 1) {
 			igt_install_exit_handler(spin_exit_handler);
-			spin(fd, e2, flags, timeout_sec);
+			spin(fd, ctx, e2->flags, flags, timeout_sec);
 		}
 	}
 
 	igt_waitchildren();
 }
 
-static void spin_all(int i915, unsigned int flags)
+static void spin_all(int i915, const intel_ctx_t *ctx, unsigned int flags)
 #define PARALLEL_SPIN_NEW_CTX BIT(0)
 {
+	const struct intel_execution_engine2 *e;
+	intel_ctx_cfg_t cfg = ctx->cfg;
 	struct igt_spin *spin, *n;
+	uint64_t ahnd;
 	IGT_LIST_HEAD(list);
 
-	for_each_physical_engine(e, i915) {
-		uint32_t ctx;
+	for_each_ctx_cfg_engine(i915, &cfg, e) {
+		if (!gem_class_can_store_dword(i915, e->class))
+			continue;
 
-		ctx = 0;
 		if (flags & PARALLEL_SPIN_NEW_CTX)
-			ctx = gem_context_create(i915);
+			ctx = intel_ctx_create(i915, &cfg);
+		ahnd = get_reloc_ahnd(i915, ctx->id);
 
 		/* Prevent preemption so only one is allowed on each engine */
 		spin = igt_spin_new(i915,
+				    .ahnd = ahnd,
 				    .ctx = ctx,
-				    .engine = eb_ring(e),
+				    .engine = e->flags,
 				    .flags = (IGT_SPIN_POLL_RUN |
 					      IGT_SPIN_NO_PREEMPTION));
-		if (ctx)
-			gem_context_destroy(i915, ctx);
 
 		igt_spin_busywait_until_started(spin);
 		igt_list_move(&spin->link, &list);
@@ -166,71 +168,115 @@ static void spin_all(int i915, unsigned int flags)
 
 	igt_list_for_each_entry_safe(spin, n, &list, link) {
 		igt_assert(gem_bo_busy(i915, spin->handle));
+		ahnd = spin->opts.ahnd;
+		igt_spin_end(spin);
+		if (flags & PARALLEL_SPIN_NEW_CTX)
+			intel_ctx_destroy(i915, spin->opts.ctx);
+		gem_sync(i915, spin->handle);
 		igt_spin_free(i915, spin);
+		put_ahnd(ahnd);
 	}
+}
+
+static bool has_userptr(int fd)
+{
+	struct drm_i915_gem_userptr userptr;
+	int err;
+
+	memset(&userptr, 0, sizeof(userptr));
+	userptr.user_size = 8192;
+	userptr.user_ptr = -4096;
+
+	err = 0;
+	if (drmIoctl(fd, DRM_IOCTL_I915_GEM_USERPTR, &userptr)) {
+		err = errno;
+		igt_assume(err);
+	}
+	errno = 0;
+
+	return err == EFAULT;
 }
 
 igt_main
 {
 	const struct intel_execution_engine2 *e2;
-	const struct intel_execution_engine *e;
-	struct intel_execution_engine2 e2__;
+	const struct intel_execution_ring *e;
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
+		ctx = intel_ctx_create_all_physical(fd);
+
 		igt_fork_hang_detector(fd);
 	}
 
-	for (e = intel_execution_engines; e->name; e++) {
-		e2__ = gem_eb_flags_to_engine(eb_ring(e));
-		if (e2__.flags == -1)
-			continue;
-		e2 = &e2__;
+#define test_each_legacy_ring(test) \
+	igt_subtest_with_dynamic(test) \
+		for (e = intel_execution_rings; e->name; e++) \
+			if (gem_has_ring(fd, eb_ring(e))) \
+				igt_dynamic_f("%s", e->name)
 
-		igt_subtest_f("legacy-%s", e->name)
-			spin(fd, e2, 0, 3);
+	test_each_legacy_ring("legacy")
+		spin(fd, intel_ctx_0(fd), eb_ring(e), 0, 3);
+	test_each_legacy_ring("legacy-resubmit")
+		spin_resubmit(fd, intel_ctx_0(fd), eb_ring(e), 0);
+	test_each_legacy_ring("legacy-resubmit-new")
+		spin_resubmit(fd, intel_ctx_0(fd), eb_ring(e), RESUBMIT_NEW_CTX);
 
-		igt_subtest_f("legacy-resubmit-%s", e->name)
-			spin_resubmit(fd, e2, 0);
-
-		igt_subtest_f("legacy-resubmit-new-%s", e->name)
-			spin_resubmit(fd, e2, RESUBMIT_NEW_CTX);
-	}
+#undef test_each_legacy_ring
 
 	igt_subtest("spin-all")
-		spin_all(fd, 0);
+		spin_all(fd, ctx, 0);
 	igt_subtest("spin-all-new")
-		spin_all(fd, PARALLEL_SPIN_NEW_CTX);
+		spin_all(fd, ctx, PARALLEL_SPIN_NEW_CTX);
 
-	__for_each_physical_engine(fd, e2) {
-		igt_subtest_f("%s", e2->name)
-			spin(fd, e2, 0, 3);
+#define test_each_engine(test) \
+	igt_subtest_with_dynamic(test) \
+		for_each_ctx_engine(fd, ctx, e2) \
+			igt_dynamic_f("%s", e2->name)
 
-		igt_subtest_f("resubmit-%s", e2->name)
-			spin_resubmit(fd, e2, 0);
+	test_each_engine("engines")
+		spin(fd, ctx, e2->flags, 0, 3);
 
-		igt_subtest_f("resubmit-new-%s", e2->name)
-			spin_resubmit(fd, e2, RESUBMIT_NEW_CTX);
+	test_each_engine("resubmit")
+		spin_resubmit(fd, ctx, e2->flags, 0);
 
-		igt_subtest_f("resubmit-all-%s", e2->name)
-			spin_resubmit(fd, e2, RESUBMIT_ALL_ENGINES);
+	test_each_engine("resubmit-new")
+		spin_resubmit(fd, ctx, e2->flags,
+			      RESUBMIT_NEW_CTX);
 
-		igt_subtest_f("resubmit-new-all-%s", e2->name)
-			spin_resubmit(fd, e2,
-				      RESUBMIT_NEW_CTX |
-				      RESUBMIT_ALL_ENGINES);
+	test_each_engine("resubmit-all")
+		spin_resubmit(fd, ctx, e2->flags,
+			      RESUBMIT_ALL_ENGINES);
+
+	test_each_engine("resubmit-new-all")
+		spin_resubmit(fd, ctx, e2->flags,
+			      RESUBMIT_NEW_CTX |
+			      RESUBMIT_ALL_ENGINES);
+
+#undef test_each_engine
+
+	igt_subtest_group {
+		igt_fixture
+			intel_allocator_multiprocess_start();
+
+		igt_subtest("spin-each")
+			spin_on_all_engines(fd, ctx, 0, 3);
+
+		igt_subtest("user-each") {
+			igt_require(has_userptr(fd));
+			spin_on_all_engines(fd, ctx, IGT_SPIN_USERPTR, 3);
+		}
+
+		igt_fixture
+			intel_allocator_multiprocess_stop();
 	}
-
-	igt_subtest("spin-each")
-		spin_on_all_engines(fd, 0, 3);
-
-	igt_subtest("user-each")
-		spin_on_all_engines(fd, IGT_SPIN_USERPTR, 3);
 
 	igt_fixture {
 		igt_stop_hang_detector();
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
 	}
 }

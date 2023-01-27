@@ -25,7 +25,6 @@
  * Testcase: drmGetMagic() and drmAuthMagic()
  */
 
-#include "igt.h"
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -47,6 +46,9 @@
 #ifndef __linux__
 # include <pthread.h>
 #endif
+
+#include "igt.h"
+#include "igt_types.h"
 
 IGT_TEST_DESCRIPTION("Call drmGetMagic() and drmAuthMagic() and see if it behaves.");
 
@@ -192,9 +194,8 @@ static void test_basic_auth(int master)
 
 igt_main
 {
-	int master;
-
 	/* root (which we run igt as) should always be authenticated */
+	igt_describe("Check drm client is always authenticated.");
 	igt_subtest("getclient-simple") {
 		int fd = drm_open_driver(DRIVER_ANY);
 
@@ -203,6 +204,7 @@ igt_main
 		close(fd);
 	}
 
+	igt_describe("Use 2 clients, check second is authenticated even when first dropped.");
 	igt_subtest("getclient-master-drop") {
 		int fd = drm_open_driver(DRIVER_ANY);
 		int fd2 = drm_open_driver(DRIVER_ANY);
@@ -218,13 +220,17 @@ igt_main
 
 	/* above tests require that no drm fd is open */
 	igt_subtest_group {
+		igt_fd_t(master);
+
 		igt_fixture
 			master = drm_open_driver_master(DRIVER_ANY);
-
+	
+		igt_describe("Test magic numbers for master and slave.");
 		igt_subtest("basic-auth")
 			test_basic_auth(master);
 
 		/* this must be last, we adjust the rlimit */
+		igt_describe("Test authentication and magic numbers uniqness for rlimit slaves.");
 		igt_subtest("many-magics")
 			test_many_magics(master);
 	}

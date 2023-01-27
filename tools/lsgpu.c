@@ -73,6 +73,7 @@ enum {
 	OPT_PRINT_SIMPLE   = 's',
 	OPT_PRINT_DETAIL   = 'p',
 	OPT_NUMERIC        = 'n',
+	OPT_CODENAME       = 'c',
 	OPT_LIST_VENDORS   = 'v',
 	OPT_LIST_FILTERS   = 'l',
 	OPT_DEVICE         = 'd',
@@ -88,6 +89,7 @@ static const char *usage_str =
 	"usage: lsgpu [options]\n\n"
 	"Options:\n"
 	"  -n, --numeric               Print vendor/device as hex\n"
+	"  -c, --codename              Print codename instead pretty device name\n"
 	"  -s, --print-simple          Print simple (legacy) device details\n"
 	"  -p, --print-details         Print devices with details\n"
 	"  -v, --list-vendors          List recognized vendors\n"
@@ -163,6 +165,7 @@ int main(int argc, char *argv[])
 		{"sysfs",             no_argument,       NULL, 1},
 		{"pci",               no_argument,       NULL, 2},
 		{"numeric",           no_argument,       NULL, OPT_NUMERIC},
+		{"codename",          no_argument,       NULL, OPT_CODENAME},
 		{"print-simple",      no_argument,       NULL, OPT_PRINT_SIMPLE},
 		{"print-detail",      no_argument,       NULL, OPT_PRINT_DETAIL},
 		{"list-vendors",      no_argument,       NULL, OPT_LIST_VENDORS},
@@ -171,18 +174,21 @@ int main(int argc, char *argv[])
 		{"help",              no_argument,       NULL, OPT_HELP},
 		{0, 0, 0, 0}
 	};
-	int c, index = 0;
+	int c, ret = 0, index = 0;
 	char *env_device = NULL, *opt_device = NULL, *rc_device = NULL;
 	struct igt_devices_print_format fmt = {
 			.type = IGT_PRINT_USER,
 	};
 
-	while ((c = getopt_long(argc, argv, "nspvld:h",
+	while ((c = getopt_long(argc, argv, "ncspvld:h",
 				long_options, &index)) != -1) {
 		switch(c) {
 
 		case OPT_NUMERIC:
 			fmt.numeric = true;
+			break;
+		case OPT_CODENAME:
+			fmt.codename = true;
 			break;
 		case OPT_PRINT_SIMPLE:
 			fmt.type = IGT_PRINT_SIMPLE;
@@ -257,7 +263,8 @@ int main(int argc, char *argv[])
 
 		if (!igt_device_card_match(igt_device, &card)) {
 			printf("No device found for the filter\n\n");
-			return -1;
+			ret = -1;
+			goto out;
 		}
 
 		printf("Device detail:\n");
@@ -272,9 +279,10 @@ int main(int argc, char *argv[])
 	} else {
 		igt_devices_print(&fmt);
 	}
-
+out:
+	igt_devices_free();
 	free(rc_device);
 	free(opt_device);
 
-	return 0;
+	return ret;
 }

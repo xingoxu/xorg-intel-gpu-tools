@@ -24,6 +24,8 @@
 
 #include <sys/ioctl.h>
 #include <cairo.h>
+
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_x86.h"
 #include "intel_bufops.h"
@@ -87,6 +89,7 @@
 #define TILE_Y      TILE_DEF(I915_TILING_Y)
 #define TILE_Yf     TILE_DEF(I915_TILING_Yf)
 #define TILE_Ys     TILE_DEF(I915_TILING_Ys)
+#define TILE_4      TILE_DEF(I915_TILING_4)
 
 #define CCS_OFFSET(buf) (buf->ccs[0].offset)
 #define CCS_SIZE(gen, buf) \
@@ -98,21 +101,24 @@ struct buf_ops {
 	int fd;
 	int gen_start;
 	int gen_end;
-	int intel_gen;
+	unsigned int intel_gen;
 	uint32_t supported_tiles;
 	uint32_t supported_hw_tiles;
 	uint32_t swizzle_x;
 	uint32_t swizzle_y;
+	uint32_t swizzle_tile4;
 	bo_copy linear_to;
 	bo_copy linear_to_x;
 	bo_copy linear_to_y;
 	bo_copy linear_to_yf;
 	bo_copy linear_to_ys;
+	bo_copy linear_to_tile4;
 	bo_copy to_linear;
 	bo_copy x_to_linear;
 	bo_copy y_to_linear;
 	bo_copy yf_to_linear;
 	bo_copy ys_to_linear;
+	bo_copy tile4_to_linear;
 };
 
 static const char *tiling_str(uint32_t tiling)
@@ -123,6 +129,7 @@ static const char *tiling_str(uint32_t tiling)
 	case I915_TILING_Y:    return "Y";
 	case I915_TILING_Yf:   return "Yf";
 	case I915_TILING_Ys:   return "Ys";
+	case I915_TILING_4:    return "4";
 	default:               return "UNKNOWN";
 	}
 }
@@ -220,7 +227,8 @@ static void set_hw_tiled(struct buf_ops *bops, struct intel_buf *buf)
 {
 	uint32_t ret_tiling, ret_swizzle;
 
-	if (buf->tiling != I915_TILING_X && buf->tiling != I915_TILING_Y)
+	if (buf->tiling != I915_TILING_X && buf->tiling != I915_TILING_Y &&
+	    buf->tiling != I915_TILING_4)
 		return;
 
 	if (!buf_ops_has_hw_fence(bops, buf->tiling)) {
@@ -318,6 +326,50 @@ static void *y_ptr(void *ptr,
 	return ptr + pos;
 }
 
+/*
+ * (x,y) to memory location in tiled-4 surface
+ *
+ * coverted those divisions and multiplications to shifts and masks
+ * in hope this wouldn't be so slow.
+ */
+static void *tile4_ptr(void *ptr,
+			unsigned int x, unsigned int y,
+			unsigned int stride, unsigned int cpp)
+{
+	const int tile_width = 128;
+	const int tile_height = 32;
+	const int subtile_size = 64;
+	const int owords = 16;
+	int base, _x, _y, subtile, tile_x, tile_y;
+	int x_loc = x << __builtin_ctz(cpp);
+	int pos;
+
+	/* Pixel in tile via masks */
+	tile_x = x_loc & (tile_width - 1);
+	tile_y = y & (tile_height - 1);
+
+	/* subtile in 4k tile */
+	_x = tile_x >> __builtin_ctz(owords);
+	_y = tile_y >> 2;
+
+	/* tile-4 swizzle */
+	subtile = ((_y >> 1) << 4) + ((_y & 1) << 2) + (_x & 3) + ((_x & 4) << 1);
+
+	/* memory location */
+	base = (y >> __builtin_ctz(tile_height)) *
+		(stride << __builtin_ctz(tile_height)) +
+		(((x_loc >> __builtin_ctz(tile_width)) << __builtin_ctz(4096)));
+
+	pos = base + (subtile << __builtin_ctz(subtile_size)) +
+		((tile_y & 3) << __builtin_ctz(owords)) +
+		(tile_x & (owords - 1));
+	igt_assert((pos & (cpp - 1)) == 0);
+	pos = pos >> __builtin_ctz(cpp);
+
+	return ptr + pos;
+}
+
+
 static void *yf_ptr(void *ptr,
 		    unsigned int x, unsigned int y,
 		    unsigned int stride, unsigned int cpp)
@@ -363,6 +415,8 @@ static tile_fn __get_tile_fn_ptr(int tiling)
 	case I915_TILING_Yf:
 		fn = yf_ptr;
 		break;
+	case I915_TILING_4:
+		fn = tile4_ptr;
 	case I915_TILING_Ys:
 		/* To be implemented */
 		break;
@@ -386,10 +440,10 @@ static void __copy_ccs(struct buf_ops *bops, struct intel_buf *buf,
 		       uint32_t *linear, enum ccs_copy_direction dir)
 {
 	uint64_t size, offset, ccs_size;
+	unsigned int gen;
 	void *map;
-	int gen;
 
-	if (!buf->compression)
+	if (!buf->compression || HAS_FLATCCS(intel_get_drm_devid(bops->fd)))
 		return;
 
 	gen = bops->intel_gen;
@@ -397,11 +451,16 @@ static void __copy_ccs(struct buf_ops *bops, struct intel_buf *buf,
 	ccs_size = CCS_SIZE(gen, buf);
 	size = offset + ccs_size;
 
-	map = __gem_mmap_offset__wc(bops->fd, buf->handle, 0, size,
-				    PROT_READ | PROT_WRITE);
-	if (!map)
-		map = gem_mmap__wc(bops->fd, buf->handle, 0, size,
-				   PROT_READ | PROT_WRITE);
+	if (gem_has_lmem(bops->fd)) {
+		map = gem_mmap__device_coherent(bops->fd, buf->handle, 0, size,
+						PROT_READ | PROT_WRITE);
+	} else {
+		map = __gem_mmap_offset__wc(bops->fd, buf->handle, 0, size,
+					    PROT_READ | PROT_WRITE);
+		if (!map)
+			map = gem_mmap__wc(bops->fd, buf->handle, 0, size,
+					   PROT_READ | PROT_WRITE);
+	}
 
 	switch (dir) {
 	case CCS_LINEAR_TO_BUF:
@@ -422,7 +481,18 @@ static void *mmap_write(int fd, struct intel_buf *buf)
 {
 	void *map = NULL;
 
-	if (is_cache_coherent(fd, buf->handle)) {
+	if (gem_has_lmem(fd)) {
+		/*
+		 * set/get_caching and set_domain are no longer supported on
+		 * discrete, also the only mmap mode supportd is FIXED.
+		 */
+		map = gem_mmap_offset__fixed(fd, buf->handle, 0,
+					     buf->surface[0].size,
+					     PROT_READ | PROT_WRITE);
+		igt_assert_eq(gem_wait(fd, buf->handle, 0), 0);
+	}
+
+	if (!map && is_cache_coherent(fd, buf->handle)) {
 		map = __gem_mmap_offset__cpu(fd, buf->handle, 0, buf->surface[0].size,
 					     PROT_READ | PROT_WRITE);
 		if (!map)
@@ -453,7 +523,17 @@ static void *mmap_read(int fd, struct intel_buf *buf)
 {
 	void *map = NULL;
 
-	if (gem_has_llc(fd) || is_cache_coherent(fd, buf->handle)) {
+	if (gem_has_lmem(fd)) {
+		/*
+		 * set/get_caching and set_domain are no longer supported on
+		 * discrete, also the only supported mmap mode is FIXED.
+		 */
+		map = gem_mmap_offset__fixed(fd, buf->handle, 0,
+					     buf->surface[0].size, PROT_READ);
+		igt_assert_eq(gem_wait(fd, buf->handle, 0), 0);
+	}
+
+	if (!map && (gem_has_llc(fd) || is_cache_coherent(fd, buf->handle))) {
 		map = __gem_mmap_offset__cpu(fd, buf->handle, 0,
 					     buf->surface[0].size, PROT_READ);
 		if (!map)
@@ -528,6 +608,13 @@ static void copy_linear_to_ys(struct buf_ops *bops, struct intel_buf *buf,
 	__copy_linear_to(bops->fd, buf, linear, I915_TILING_Ys, 0);
 }
 
+static void copy_linear_to_tile4(struct buf_ops *bops, struct intel_buf *buf,
+				 uint32_t *linear)
+{
+	DEBUGFN();
+	__copy_linear_to(bops->fd, buf, linear, I915_TILING_4, bops->swizzle_tile4);
+}
+
 static void __copy_to_linear(int fd, struct intel_buf *buf,
 			     uint32_t *linear, int tiling, uint32_t swizzle)
 {
@@ -576,6 +663,13 @@ static void copy_ys_to_linear(struct buf_ops *bops, struct intel_buf *buf,
 {
 	DEBUGFN();
 	__copy_to_linear(bops->fd, buf, linear, I915_TILING_Ys, 0);
+}
+
+static void copy_tile4_to_linear(struct buf_ops *bops, struct intel_buf *buf,
+				 uint32_t *linear)
+{
+	DEBUGFN();
+	__copy_to_linear(bops->fd, buf, linear, I915_TILING_4, 0);
 }
 
 static void copy_linear_to_gtt(struct buf_ops *bops, struct intel_buf *buf,
@@ -706,10 +800,12 @@ static void __intel_buf_init(struct buf_ops *bops,
 			     uint32_t handle,
 			     struct intel_buf *buf,
 			     int width, int height, int bpp, int alignment,
-			     uint32_t req_tiling, uint32_t compression)
+			     uint32_t req_tiling, uint32_t compression,
+			     uint64_t bo_size, int bo_stride,
+			     uint32_t region)
 {
 	uint32_t tiling = req_tiling;
-	uint32_t size;
+	uint64_t size;
 	uint32_t devid;
 	int tile_width;
 	int align_h = 1;
@@ -724,47 +820,60 @@ static void __intel_buf_init(struct buf_ops *bops,
 
 	buf->bops = bops;
 	buf->addr.offset = INTEL_BUF_INVALID_ADDRESS;
+	IGT_INIT_LIST_HEAD(&buf->link);
 
 	if (compression) {
-		int aux_width, aux_height;
-
 		igt_require(bops->intel_gen >= 9);
 		igt_assert(req_tiling == I915_TILING_Y ||
-			   req_tiling == I915_TILING_Yf);
+			   req_tiling == I915_TILING_Yf ||
+			   req_tiling == I915_TILING_4);
 		/*
 		 * On GEN12+ we align the main surface to 4 * 4 main surface
 		 * tiles, which is 64kB. These 16 tiles are mapped by 4 AUX
 		 * CCS units, that is 4 * 64 bytes. These 4 CCS units are in
 		 * turn mapped by one L1 AUX page table entry.
 		 */
-		if (bops->intel_gen >= 12)
+		if (bo_stride)
+			buf->surface[0].stride = bo_stride;
+		else if (bops->intel_gen >= 12)
 			buf->surface[0].stride = ALIGN(width * (bpp / 8), 128 * 4);
 		else
 			buf->surface[0].stride = ALIGN(width * (bpp / 8), 128);
 
 		if (bops->intel_gen >= 12)
-			height = ALIGN(height, 4 * 32);
+			height = ALIGN(height, 32);
 
 		buf->surface[0].size = buf->surface[0].stride * height;
 		buf->tiling = tiling;
 		buf->bpp = bpp;
 		buf->compression = compression;
 
-		aux_width = intel_buf_ccs_width(bops->intel_gen, buf);
-		aux_height = intel_buf_ccs_height(bops->intel_gen, buf);
+		if (!HAS_FLATCCS(intel_get_drm_devid(bops->fd))) {
+			int aux_width, aux_height;
 
-		buf->ccs[0].offset = buf->surface[0].stride * ALIGN(height, 32);
-		buf->ccs[0].stride = aux_width;
+			aux_width = intel_buf_ccs_width(bops->intel_gen, buf);
+			aux_height = intel_buf_ccs_height(bops->intel_gen, buf);
 
-		size = buf->ccs[0].offset + aux_width * aux_height;
+			buf->ccs[0].offset = buf->surface[0].stride * ALIGN(height, 32);
+			buf->ccs[0].stride = aux_width;
+			size = buf->ccs[0].offset + aux_width * aux_height;
+		} else {
+			size = buf->ccs[0].offset;
+		}
 	} else {
 		if (tiling) {
 			devid =  intel_get_drm_devid(bops->fd);
 			tile_width = get_stride(devid, tiling);
-			buf->surface[0].stride = ALIGN(width * (bpp / 8), tile_width);
+			if (bo_stride)
+				buf->surface[0].stride = bo_stride;
+			else
+				buf->surface[0].stride = ALIGN(width * (bpp / 8), tile_width);
 			align_h = tiling == I915_TILING_X ? 8 : 32;
 		} else {
-			buf->surface[0].stride = ALIGN(width * (bpp / 8), alignment ?: 1);
+			if (bo_stride)
+				buf->surface[0].stride = bo_stride;
+			else
+				buf->surface[0].stride = ALIGN(width * (bpp / 8), alignment ?: 1);
 		}
 
 		buf->surface[0].size = buf->surface[0].stride * height;
@@ -774,10 +883,21 @@ static void __intel_buf_init(struct buf_ops *bops,
 		size = buf->surface[0].stride * ALIGN(height, align_h);
 	}
 
-	if (handle)
-		buf->handle = handle;
-	else
-		buf->handle = gem_create(bops->fd, size);
+	if (bo_size > 0) {
+		igt_assert(bo_size >= size);
+		size = bo_size;
+	}
+
+	/* Store buffer size to avoid mistakes in calculating it again */
+	buf->size = size;
+	buf->handle = handle;
+
+	if (!handle)
+		if (__gem_create_in_memory_regions(bops->fd, &buf->handle, &size, region))
+			igt_assert_eq(__gem_create(bops->fd, &size, &buf->handle), 0);
+
+	/* Store gem bo size */
+	buf->bo_size = size;
 
 	set_hw_tiled(bops, buf);
 }
@@ -804,7 +924,24 @@ void intel_buf_init(struct buf_ops *bops,
 		    uint32_t tiling, uint32_t compression)
 {
 	__intel_buf_init(bops, 0, buf, width, height, bpp, alignment,
-			 tiling, compression);
+			 tiling, compression, 0, 0, I915_SYSTEM_MEMORY);
+
+	intel_buf_set_ownership(buf, true);
+}
+
+/**
+ * intel_buf_init_in_region
+ *
+ * Same as intel_buf_init with the additional region argument
+ */
+void intel_buf_init_in_region(struct buf_ops *bops,
+			      struct intel_buf *buf,
+			      int width, int height, int bpp, int alignment,
+			      uint32_t tiling, uint32_t compression,
+			      uint32_t region)
+{
+	__intel_buf_init(bops, 0, buf, width, height, bpp, alignment,
+			 tiling, compression, 0, 0, region);
 
 	intel_buf_set_ownership(buf, true);
 }
@@ -816,12 +953,22 @@ void intel_buf_init(struct buf_ops *bops,
  *
  * Function closes gem BO inside intel_buf if bo is owned by intel_buf.
  * For handle passed from the caller intel_buf doesn't take ownership and
- * doesn't close it in close()/destroy() paths.
+ * doesn't close it in close()/destroy() paths. When intel_buf was previously
+ * added to intel_bb (intel_bb_add_intel_buf() call) it is tracked there and
+ * must be removed from its internal structures.
  */
 void intel_buf_close(struct buf_ops *bops, struct intel_buf *buf)
 {
 	igt_assert(bops);
 	igt_assert(buf);
+
+	/* If buf is tracked by some intel_bb ensure it will be removed there */
+	if (buf->ibb) {
+		intel_bb_remove_intel_buf(buf->ibb, buf);
+		buf->addr.offset = INTEL_BUF_INVALID_ADDRESS;
+		buf->ibb = NULL;
+		IGT_INIT_LIST_HEAD(&buf->link);
+	}
 
 	if (buf->is_owner)
 		gem_close(bops->fd, buf->handle);
@@ -853,7 +1000,7 @@ void intel_buf_init_using_handle(struct buf_ops *bops,
 				 uint32_t req_tiling, uint32_t compression)
 {
 	__intel_buf_init(bops, handle, buf, width, height, bpp, alignment,
-			 req_tiling, compression);
+			 req_tiling, compression, 0, 0, -1);
 }
 
 /**
@@ -921,6 +1068,29 @@ struct intel_buf *intel_buf_create_using_handle(struct buf_ops *bops,
 
 	return buf;
 }
+
+struct intel_buf *intel_buf_create_using_handle_and_size(struct buf_ops *bops,
+							 uint32_t handle,
+							 int width, int height,
+							 int bpp, int alignment,
+							 uint32_t req_tiling,
+							 uint32_t compression,
+							 uint64_t size,
+							 int stride)
+{
+	struct intel_buf *buf;
+
+	igt_assert(bops);
+
+	buf = calloc(1, sizeof(*buf));
+	igt_assert(buf);
+
+	__intel_buf_init(bops, handle, buf, width, height, bpp, alignment,
+			 req_tiling, compression, size, stride, -1);
+
+	return buf;
+}
+
 
 /**
  * intel_buf_destroy
@@ -999,11 +1169,12 @@ void intel_buf_flush_and_unmap(struct intel_buf *buf)
 void intel_buf_print(const struct intel_buf *buf)
 {
 	igt_info("[name: %s]\n", buf->name);
-	igt_info("[%u]: w: %u, h: %u, stride: %u, size: %u, bo-size: %u, "
-		 "bpp: %u, tiling: %u, compress: %u\n",
+	igt_info("[%u]: w: %u, h: %u, stride: %u, size: %" PRIx64
+		 ", buf-size: %" PRIx64 ", bo-size: %" PRIx64
+		 ", bpp: %u, tiling: %u, compress: %u\n",
 		 buf->handle, intel_buf_width(buf), intel_buf_height(buf),
 		 buf->surface[0].stride, buf->surface[0].size,
-		 intel_buf_bo_size(buf), buf->bpp,
+		 intel_buf_size(buf), intel_buf_bo_size(buf), buf->bpp,
 		 buf->tiling, buf->compression);
 	igt_info(" ccs <offset: %u, stride: %u, w: %u, h: %u> cc <offset: %u>\n",
 		 buf->ccs[0].offset,
@@ -1017,7 +1188,7 @@ void intel_buf_print(const struct intel_buf *buf)
 void intel_buf_dump(const struct intel_buf *buf, const char *filename)
 {
 	int i915 = buf_ops_get_fd(buf->bops);
-	uint64_t size = intel_buf_bo_size(buf);
+	uint64_t size = intel_buf_size(buf);
 	FILE *out;
 	void *ptr;
 
@@ -1043,9 +1214,9 @@ static void __intel_buf_write_to_png(struct buf_ops *bops,
 	cairo_status_t ret;
 	void *linear;
 	int format, width, height, stride, offset;
-	int gen = bops->intel_gen;
+	unsigned int gen = bops->intel_gen;
 
-	igt_assert_eq(posix_memalign(&linear, 16, intel_buf_bo_size(buf)), 0);
+	igt_assert_eq(posix_memalign(&linear, 16, intel_buf_size(buf)), 0);
 
 	format = write_ccs ? CAIRO_FORMAT_A8 : CAIRO_FORMAT_RGB24;
 	width = write_ccs ? intel_buf_ccs_width(gen, buf) : intel_buf_width(buf);
@@ -1080,19 +1251,21 @@ void intel_buf_write_aux_to_png(struct intel_buf *buf, const char *filename)
 #define DEFAULT_BUFOPS(__gen_start, __gen_end) \
 	.gen_start          = __gen_start, \
 	.gen_end            = __gen_end, \
-	.supported_hw_tiles = TILE_X | TILE_Y, \
+	.supported_hw_tiles = TILE_X | TILE_Y | TILE_4, \
 	.linear_to          = copy_linear_to_wc, \
 	.linear_to_x        = copy_linear_to_gtt, \
 	.linear_to_y        = copy_linear_to_gtt, \
 	.linear_to_yf       = copy_linear_to_yf, \
 	.linear_to_ys       = copy_linear_to_ys, \
+	.linear_to_tile4    = copy_linear_to_tile4, \
 	.to_linear          = copy_wc_to_linear, \
 	.x_to_linear        = copy_gtt_to_linear, \
 	.y_to_linear        = copy_gtt_to_linear, \
 	.yf_to_linear       = copy_yf_to_linear, \
-	.ys_to_linear       = copy_ys_to_linear
+	.ys_to_linear       = copy_ys_to_linear, \
+	.tile4_to_linear    = copy_tile4_to_linear
 
-struct buf_ops buf_ops_arr[] = {
+static const struct buf_ops buf_ops_arr[] = {
 	{
 		DEFAULT_BUFOPS(2, 8),
 		.supported_tiles    = TILE_NONE | TILE_X | TILE_Y,
@@ -1104,8 +1277,8 @@ struct buf_ops buf_ops_arr[] = {
 	},
 
 	{
-		DEFAULT_BUFOPS(12, 12),
-		.supported_tiles   = TILE_NONE | TILE_X | TILE_Y | TILE_Yf | TILE_Ys,
+		DEFAULT_BUFOPS(12, ~0U),
+		.supported_tiles   = TILE_NONE | TILE_X | TILE_Y | TILE_Yf | TILE_Ys | TILE_4,
 	},
 };
 
@@ -1134,6 +1307,8 @@ static bool probe_hw_tiling(struct buf_ops *bops, uint32_t tiling,
 			bops->swizzle_x = buf_swizzle;
 		else if (tiling == I915_TILING_Y)
 			bops->swizzle_y = buf_swizzle;
+		else if (tiling == I915_TILING_4)
+			bops->swizzle_tile4 = buf_swizzle;
 
 		*swizzling_supported = buf_swizzle == phys_swizzle;
 	}
@@ -1206,40 +1381,40 @@ static void idempotency_selftest(struct buf_ops *bops, uint32_t tiling)
 	buf_ops_set_software_tiling(bops, tiling, false);
 }
 
-uint32_t intel_buf_bo_size(const struct intel_buf *buf)
+uint64_t intel_buf_size(const struct intel_buf *buf)
 {
-	int offset = CCS_OFFSET(buf) ?: buf->surface[0].size;
-	int ccs_size =
-		buf->compression ? CCS_SIZE(buf->bops->intel_gen, buf) : 0;
+	return buf->size;
+}
 
-	return offset + ccs_size;
+uint64_t intel_buf_bo_size(const struct intel_buf *buf)
+{
+	return buf->bo_size;
 }
 
 static struct buf_ops *__buf_ops_create(int fd, bool check_idempotency)
 {
 	struct buf_ops *bops = calloc(1, sizeof(*bops));
+	unsigned int generation;
 	uint32_t devid;
-	int generation;
 
 	igt_assert(bops);
 
 	devid = intel_get_drm_devid(fd);
 	generation = intel_gen(devid);
 
-	/* Predefined settings */
+	/* Predefined settings: see intel_device_info? */
 	for (int i = 0; i < ARRAY_SIZE(buf_ops_arr); i++) {
 		if (generation >= buf_ops_arr[i].gen_start &&
 		    generation <= buf_ops_arr[i].gen_end) {
 			memcpy(bops, &buf_ops_arr[i], sizeof(*bops));
-			bops->fd = fd;
-			bops->intel_gen = generation;
-			igt_debug("generation: %d, supported tiles: 0x%02x\n",
-				  generation, bops->supported_tiles);
 			break;
 		}
 	}
 
-	igt_assert(bops->intel_gen);
+	bops->fd = fd;
+	bops->intel_gen = generation;
+	igt_debug("generation: %d, supported tiles: 0x%02x\n",
+		  bops->intel_gen, bops->supported_tiles);
 
 	/*
 	 * Warning!
@@ -1290,6 +1465,24 @@ static struct buf_ops *__buf_ops_create(int fd, bool check_idempotency)
 			bops->supported_hw_tiles &= ~TILE_Y;
 			bops->linear_to_y = copy_linear_to_y;
 			bops->y_to_linear = copy_y_to_linear;
+		}
+	}
+
+	if (is_hw_tiling_supported(bops, I915_TILING_4)) {
+		bool swizzling_supported;
+		bool supported = probe_hw_tiling(bops, I915_TILING_4,
+						 &swizzling_supported);
+
+		if (!swizzling_supported) {
+			igt_debug("Swizzling for 4 is not supported\n");
+			bops->supported_tiles &= ~TILE_4;
+		}
+
+		igt_debug("4 fence support: %s\n", bool_str(supported));
+		if (!supported) {
+			bops->supported_hw_tiles &= ~TILE_4;
+			bops->linear_to_tile4 = copy_linear_to_tile4;
+			bops->tile4_to_linear = copy_tile4_to_linear;
 		}
 	}
 

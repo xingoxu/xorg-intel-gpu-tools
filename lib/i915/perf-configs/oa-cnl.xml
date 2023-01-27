@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
-<metrics version="1582124705" merge_md5="">
-  <set name="Render Metrics Basic Gen10"
+<metrics version="1619078711" merge_md5="">
+  <set name="Render Metrics Basic set"
        chipset="CNL"
        symbol_name="RenderBasic"
        underscore_name="render_basic"
@@ -829,12 +829,12 @@
     </register_config>
   </set>
 
-  <set name="Compute Metrics Basic Gen10"
+  <set name="Compute Metrics Basic set"
        chipset="CNL"
        symbol_name="ComputeBasic"
        underscore_name="compute_basic"
        mdapi_supported_apis="VK OGL OCL IO BB"
-       hw_config_guid="eed14f91-5f03-4e3a-8281-ac38030ac573"
+       hw_config_guid="0b128ae2-ed06-481e-afe3-2404aab91415"
        >
     <counter name="GPU Time Elapsed"
              symbol_name="GpuTime"
@@ -1507,10 +1507,11 @@
         <register type="FLEX" address="0x0000E558" value="0x00000003" />
         <register type="FLEX" address="0x0000E658" value="0x00002001" />
         <register type="FLEX" address="0x0000E758" value="0x00000008" />
+        <register type="FLEX" address="0x0000E65C" value="0x00222222" />
     </register_config>
   </set>
 
-  <set name="Render Metrics for 3D Pipeline Profile Gen10"
+  <set name="Render Metrics for 3D Pipeline Profile set"
        chipset="CNL"
        symbol_name="RenderPipeProfile"
        underscore_name="render_pipe_profile"
@@ -2258,7 +2259,7 @@
     </register_config>
   </set>
 
-  <set name="Memory Reads Distribution Gen10"
+  <set name="Memory Reads Distribution metrics set"
        chipset="CNL"
        symbol_name="MemoryReads"
        underscore_name="memory_reads"
@@ -2882,7 +2883,7 @@
     </register_config>
   </set>
 
-  <set name="Memory Writes Distribution Gen10"
+  <set name="Memory Writes Distribution metrics set"
        chipset="CNL"
        symbol_name="MemoryWrites"
        underscore_name="memory_writes"
@@ -3505,7 +3506,7 @@
     </register_config>
   </set>
 
-  <set name="Compute Metrics Extended Gen10"
+  <set name="Compute Metrics Extended metrics set"
        chipset="CNL"
        symbol_name="ComputeExtended"
        underscore_name="compute_extended"
@@ -4134,7 +4135,7 @@
     </register_config>
   </set>
 
-  <set name="Compute Metrics L3 Cache Gen10"
+  <set name="Compute Metrics L3 Cache metrics set"
        chipset="CNL"
        symbol_name="ComputeL3Cache"
        underscore_name="compute_l3_cache"
@@ -4721,6 +4722,19 @@
              mdapi_supported_apis=""
              mdapi_hw_unit_type="gpu"
              />
+    <counter name="Shader Barrier Messages"
+             symbol_name="ShaderBarriers"
+             underscore_name="shader_barriers"
+             description="The total number of shader barrier messages."
+             data_type="uint64"
+             units="messages"
+             semantic_type="event"
+             equation="A 35 READ"
+             mdapi_group="EU Array/Barrier"
+             mdapi_usage_flags="Tier3 Frame Batch Draw"
+             mdapi_supported_apis=""
+             mdapi_hw_unit_type="gpu"
+             />
     <counter name="Slice0 L3 Bank0 Accesses"
              symbol_name="L3Bank00Accesses"
              underscore_name="l3_bank00_accesses"
@@ -4828,19 +4842,6 @@
              semantic_type="throughput"
              equation="$L3Accesses 64 UMUL"
              mdapi_group="L3"
-             mdapi_usage_flags="Tier3 Frame Batch Draw"
-             mdapi_supported_apis=""
-             mdapi_hw_unit_type="gpu"
-             />
-    <counter name="Shader Barrier Messages"
-             symbol_name="ShaderBarriers"
-             underscore_name="shader_barriers"
-             description="The total number of shader barrier messages."
-             data_type="uint64"
-             units="messages"
-             semantic_type="event"
-             equation="A 35 READ"
-             mdapi_group="EU Array/Barrier"
              mdapi_usage_flags="Tier3 Frame Batch Draw"
              mdapi_supported_apis=""
              mdapi_hw_unit_type="gpu"
@@ -10196,7 +10197,7 @@
        symbol_name="TestOa"
        underscore_name="test_oa"
        mdapi_supported_apis="VK OGL OCL IO BB"
-       hw_config_guid="db41edd4-d8e7-4730-ad11-b9a2d6833503"
+       hw_config_guid="99517a69-b9a7-4124-8f59-06645ea13187"
        >
     <counter name="GPU Time Elapsed"
              symbol_name="GpuTime"
@@ -10405,6 +10406,9 @@
         <register type="OA" address="0x000027A4" value="0x0000FFE7" />
         <register type="OA" address="0x000027A8" value="0x00100001" />
         <register type="OA" address="0x000027AC" value="0x0000FFE7" />
+    </register_config>
+    <register_config type="FLEX">
+        <register type="FLEX" address="0x0000E65C" value="0x00222222" />
     </register_config>
   </set>
 

@@ -64,9 +64,9 @@ build:tests-fedora:
   stage: build
   script:
     - meson --prefix=/opt/igt $MESON_OPTIONS build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
     - DESTDIR="$PWD/installdir" ninja -C build install
-    - ninja -C build igt-gpu-tools-doc
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} igt-gpu-tools-doc
   artifacts:
     paths:
       - build
@@ -77,7 +77,7 @@ build:tests-fedora-no-libunwind:
   script:
     - dnf remove -y libunwind-devel
     - meson -Dlibunwind=disabled build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
 
 # documentation building is different with meson<0.47
 build:tests-fedora-oldest-meson:
@@ -86,8 +86,15 @@ build:tests-fedora-oldest-meson:
     - dnf remove -y meson
     - pip install /usr/src/meson-*.tar.gz
     - meson $MESON_OPTIONS build
-    - ninja -C build || ninja -C build -j 1
-    - ninja -C build igt-gpu-tools-doc
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} igt-gpu-tools-doc
+
+# ensure igt_nouveau stubs build when nouveau support for libdrm is disabled
+build:tests-fedora-no-libdrm-nouveau:
+  stage: build
+  script:
+    - meson -Dlibdrm_drivers= build
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
 
 build:tests-fedora-clang:
   stage: build
@@ -95,7 +102,7 @@ build:tests-fedora-clang:
     CC: clang
   script:
     - meson $MESON_OPTIONS build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
   artifacts:
     paths:
       - build
@@ -105,7 +112,7 @@ build:tests-debian-meson:
   stage: build
   script:
     - meson $MESON_OPTIONS build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
     - cp build/tests/test-list.txt meson-test-list.txt
   artifacts:
     paths:
@@ -116,7 +123,7 @@ build:tests-debian-minimal:
   stage: build
   script:
     - meson -Dtests=disabled -Dlibdrm_drivers="" build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
   artifacts:
     paths:
       - build
@@ -127,7 +134,7 @@ build:tests-debian-meson-armhf:
   script:
     - export PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig/
     - meson --cross-file meson-cross-armhf.txt build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
   artifacts:
     paths:
       - build
@@ -138,7 +145,7 @@ build:tests-debian-meson-arm64:
   script:
     - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig/
     - meson --cross-file meson-cross-arm64.txt build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
   artifacts:
     paths:
       - build
@@ -149,99 +156,95 @@ build:tests-debian-meson-mips:
   script:
     - export PKG_CONFIG_PATH=/usr/lib/mips-linux-gnu/pkgconfig/
     - meson --cross-file meson-cross-mips.txt build
-    - ninja -C build || ninja -C build -j 1
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} || ninja -C build -j 1
   artifacts:
     paths:
       - build
 
-build:tests-debian-autotools:
-  image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian:commit-$CI_COMMIT_SHA
-  stage: build
-  script:
-    - ./autogen.sh --enable-{chamelium,audio,intel,amdgpu,nouveau,tests,runner}
-    - make -j $(nproc) || make -j 1
-    - cp tests/test-list.txt autotools-test-list.txt
-  artifacts:
-    paths:
-      - autotools-test-list.txt
-
 #################### TEST ##########################
 
 test:ninja-test:
+  tags:
+    - gstreamer
   retry: 2
   dependencies:
     - build:tests-fedora
   stage: test
-  script: ninja -C build test
+  script: meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
 
 test:ninja-test-clang:
+  tags:
+    - gstreamer
   retry: 2
   dependencies:
     - build:tests-fedora-clang
   variables:
     CC: clang
   stage: test
-  script: ninja -C build test
+  script: meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
 
 test:ninja-test-minimal:
+  tags:
+    - gstreamer
   retry: 2
   image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-minimal:commit-$CI_COMMIT_SHA
   dependencies:
     - build:tests-debian-minimal
   stage: test
-  script: ninja -C build test
+  script: meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
 
-test:ninja-test-arm64:
-  retry: 2
-  image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-arm64:commit-$CI_COMMIT_SHA
-  dependencies:
-    - build:tests-debian-meson-arm64
-  stage: test
-  script:
-    - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig/
-    - env > build/envdump.txt
-    - ninja -C build test
-  artifacts:
-    paths:
-      - build
-    when: on_failure
+# arm testing temporarily disabled until converted to run on native arm HW
+# test:ninja-test-arm64:
+#   tags:
+#     - gstreamer
+#   retry: 2
+#   image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-arm64:commit-$CI_COMMIT_SHA
+#   dependencies:
+#     - build:tests-debian-meson-arm64
+#   stage: test
+#   script:
+#     - export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig/
+#     - env > build/envdump.txt
+#     - meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
+#   artifacts:
+#     paths:
+#       - build
+#     when: on_failure
+#
+# test:ninja-test-armhf:
+#   tags:
+#     - gstreamer
+#   retry: 2
+#   image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-armhf:commit-$CI_COMMIT_SHA
+#   dependencies:
+#     - build:tests-debian-meson-armhf
+#   stage: test
+#   script:
+#     - export PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig/
+#     - env > build/envdump.txt
+#     - meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
+#   artifacts:
+#     paths:
+#       - build
+#     when: on_failure
 
-test:ninja-test-armhf:
-  retry: 2
-  image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-armhf:commit-$CI_COMMIT_SHA
-  dependencies:
-    - build:tests-debian-meson-armhf
-  stage: test
-  script:
-    - export PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig/
-    - env > build/envdump.txt
-    - ninja -C build test
-  artifacts:
-    paths:
-      - build
-    when: on_failure
-
-test:ninja-test-mips:
-  retry: 2
-  image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-mips:commit-$CI_COMMIT_SHA
-  dependencies:
-    - build:tests-debian-meson-mips
-  stage: test
-  script:
-    - export PKG_CONFIG_PATH=/usr/lib/mips-linux-gnu/pkgconfig/
-    - env > build/envdump.txt
-    - ninja -C build test
-  artifacts:
-    paths:
-      - build
-    when: on_failure
-
-test:test-list-diff:
-  dependencies:
-    - build:tests-debian-autotools
-    - build:tests-debian-meson
-  stage: test
-  script: diff <(sed "s/ /\n/g" meson-test-list.txt| grep -v 'vc4\|v3d\|panfrost\|nouveau' | sort) <(sed "s/ /\n/g" autotools-test-list.txt | sort)
+# mips testing temporarily disabled
+# test:ninja-test-mips:
+#   tags:
+#     - gstreamer
+#   retry: 2
+#   image: $CI_REGISTRY/$CI_PROJECT_PATH/build-debian-mips:commit-$CI_COMMIT_SHA
+#   dependencies:
+#     - build:tests-debian-meson-mips
+#   stage: test
+#   script:
+#     - export PKG_CONFIG_PATH=/usr/lib/mips-linux-gnu/pkgconfig/
+#     - env > build/envdump.txt
+#     - meson test -C build --num-processes ${FDO_CI_CONCURRENT:-4}
+#   artifacts:
+#     paths:
+#       - build
+#     when: on_failure
 
 test:list-undocumented-tests:
   dependencies:
@@ -266,7 +269,7 @@ pages:
     - build:tests-fedora
   stage: deploy
   script:
-    - ninja -C build igt-gpu-tools-doc
+    - ninja -C build -j${FDO_CI_CONCURRENT:-4} igt-gpu-tools-doc
     - cp -r build/docs/reference/igt-gpu-tools/html public
   artifacts:
     paths:

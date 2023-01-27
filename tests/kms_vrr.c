@@ -33,11 +33,19 @@
  */
 #define TEST_DURATION_NS (5000000000ull)
 
+#define DRM_MODE_FMT    "\"%s\": %d %d %d %d %d %d %d %d %d %d 0x%x 0x%x"
+#define DRM_MODE_ARG(m) \
+	(m)->name, (m)->vrefresh, (m)->clock, \
+	(m)->hdisplay, (m)->hsync_start, (m)->hsync_end, (m)->htotal, \
+	(m)->vdisplay, (m)->vsync_start, (m)->vsync_end, (m)->vtotal, \
+	(m)->type, (m)->flags
+
 enum {
-	TEST_NONE = 0,
-	TEST_DPMS = 1 << 0,
-	TEST_SUSPEND = 1 << 1,
-	TEST_FLIPLINE = 1 << 2,
+	TEST_BASIC = 1 << 0,
+	TEST_DPMS = 1 << 1,
+	TEST_SUSPEND = 1 << 2,
+	TEST_FLIPLINE = 1 << 3,
+	TEST_NEGATIVE = 1 << 4,
 };
 
 typedef struct range {
@@ -51,6 +59,7 @@ typedef struct data {
 	igt_plane_t *primary;
 	igt_fb_t fb0;
 	igt_fb_t fb1;
+	range_t range;
 } data_t;
 
 typedef struct vtest_ns {
@@ -108,21 +117,39 @@ static uint64_t get_time_ns(void)
 /* Returns the rate duration in nanoseconds for the given refresh rate. */
 static uint64_t rate_from_refresh(uint64_t refresh)
 {
-	return NSECS_PER_SEC / refresh;
+	return refresh ? (NSECS_PER_SEC / refresh) : 0;
 }
 
-/* Read min and max vrr range from the connector debugfs.
- *  - min range should be less than the current mode vfreq
- *  - if max range is grater than the current mode vfreq, consider
- *       current mode vfreq as the max range.
+/* Instead of running on default mode, loop through the connector modes
+ * and find the mode with max refresh rate to exercise full vrr range.
  */
-static range_t get_vrr_range(data_t *data, igt_output_t *output)
+static drmModeModeInfo
+output_mode_with_maxrate(igt_output_t *output, unsigned int vrr_max)
+{
+	int i;
+	drmModeConnectorPtr connector = output->config.connector;
+	drmModeModeInfo mode = *igt_output_get_mode(output);
+
+	igt_debug("Default Mode " DRM_MODE_FMT "\n", DRM_MODE_ARG(&mode));
+
+	for (i = 0; i < connector->count_modes; i++)
+		if (connector->modes[i].vrefresh > mode.vrefresh &&
+		    connector->modes[i].vrefresh <= vrr_max)
+			mode = connector->modes[i];
+
+	igt_debug("Override Mode " DRM_MODE_FMT "\n", DRM_MODE_ARG(&mode));
+
+	return mode;
+}
+
+/* Read min and max vrr range from the connector debugfs. */
+static range_t
+get_vrr_range(data_t *data, igt_output_t *output)
 {
 	char buf[256];
 	char *start_loc;
 	int fd, res;
 	range_t range;
-	drmModeModeInfo *mode = igt_output_get_mode(output);
 
 	fd = igt_debugfs_connector_dir(data->drm_fd, output->name, O_RDONLY);
 	igt_assert(fd >= 0);
@@ -134,23 +161,18 @@ static range_t get_vrr_range(data_t *data, igt_output_t *output)
 
 	igt_assert(start_loc = strstr(buf, "Min: "));
 	igt_assert_eq(sscanf(start_loc, "Min: %u", &range.min), 1);
-	igt_require(mode->vrefresh > range.min);
 
 	igt_assert(start_loc = strstr(buf, "Max: "));
 	igt_assert_eq(sscanf(start_loc, "Max: %u", &range.max), 1);
-
-	range.max = (mode->vrefresh < range.max) ? mode->vrefresh : range.max;
 
 	return range;
 }
 
 /* Returns vrr test frequency for min, mid & max range. */
-static vtest_ns_t get_test_rate_ns(data_t *data, igt_output_t *output)
+static vtest_ns_t get_test_rate_ns(range_t range)
 {
-	range_t range;
 	vtest_ns_t vtest_ns;
 
-	range = get_vrr_range(data, output);
 	vtest_ns.min = rate_from_refresh(range.min);
 	vtest_ns.mid = rate_from_refresh(((range.max + range.min) / 2));
 	vtest_ns.max = rate_from_refresh(range.max);
@@ -158,11 +180,16 @@ static vtest_ns_t get_test_rate_ns(data_t *data, igt_output_t *output)
 	return vtest_ns;
 }
 
-/* Returns true if an output supports VRR. */
+/* Returns true if driver supports VRR. */
 static bool has_vrr(igt_output_t *output)
 {
-	return igt_output_has_prop(output, IGT_CONNECTOR_VRR_CAPABLE) &&
-	       igt_output_get_prop(output, IGT_CONNECTOR_VRR_CAPABLE);
+	return igt_output_has_prop(output, IGT_CONNECTOR_VRR_CAPABLE);
+}
+
+/* Returns true if an output supports VRR. */
+static bool vrr_capable(igt_output_t *output)
+{
+	return igt_output_get_prop(output, IGT_CONNECTOR_VRR_CAPABLE);
 }
 
 /* Toggles variable refresh rate on the pipe. */
@@ -170,26 +197,38 @@ static void set_vrr_on_pipe(data_t *data, enum pipe pipe, bool enabled)
 {
 	igt_pipe_set_prop_value(&data->display, pipe, IGT_CRTC_VRR_ENABLED,
 				enabled);
-	igt_display_commit_atomic(&data->display, 0, NULL);
+	igt_display_commit2(&data->display, COMMIT_ATOMIC);
 }
 
 /* Prepare the display for testing on the given pipe. */
 static void prepare_test(data_t *data, igt_output_t *output, enum pipe pipe)
 {
-	drmModeModeInfo mode = *igt_output_get_mode(output);
+	drmModeModeInfo mode;
 	cairo_t *cr;
 
 	/* Reset output */
 	igt_display_reset(&data->display);
 	igt_output_set_pipe(output, pipe);
 
+	/* Capture VRR range */
+	data->range = get_vrr_range(data, output);
+
+	/* Override mode with max vrefresh.
+	 *   - vrr_min range should be less than the override mode vrefresh.
+	 *   - Limit the vrr_max range with the override mode vrefresh.
+	 */
+	mode = output_mode_with_maxrate(output, data->range.max);
+	igt_require(mode.vrefresh > data->range.min);
+	data->range.max = mode.vrefresh;
+	igt_output_override_mode(output, &mode);
+
 	/* Prepare resources */
 	igt_create_color_fb(data->drm_fd, mode.hdisplay, mode.vdisplay,
-			    DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE,
+			    DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
 			    0.50, 0.50, 0.50, &data->fb0);
 
 	igt_create_color_fb(data->drm_fd, mode.hdisplay, mode.vdisplay,
-			    DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE,
+			    DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
 			    0.50, 0.50, 0.50, &data->fb1);
 
 	cr = igt_get_cairo_ctx(data->drm_fd, &data->fb0);
@@ -208,22 +247,7 @@ static void prepare_test(data_t *data, igt_output_t *output, enum pipe pipe)
 	 */
 	igt_pipe_set_prop_value(&data->display, pipe, IGT_CRTC_VRR_ENABLED, 0);
 
-	igt_display_commit_atomic(&data->display,
-				  DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
-}
-
-/* Waits for the vblank interval. Returns the vblank timestamp in ns. */
-static uint64_t
-wait_for_vblank(data_t *data, enum pipe pipe)
-{
-	drmVBlank vbl = {};
-
-	vbl.request.type = kmstest_get_vbl_flag(pipe);
-	vbl.request.type |= DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT;
-	vbl.request.sequence = 1;
-	drmWaitVBlank(data->drm_fd, &vbl);
-
-	return get_kernel_event_ns(data, DRM_EVENT_VBLANK);
+	igt_display_commit2(&data->display, COMMIT_ATOMIC);
 }
 
 /* Performs an atomic non-blocking page-flip on a pipe. */
@@ -260,17 +284,18 @@ static uint32_t
 flip_and_measure(data_t *data, igt_output_t *output, enum pipe pipe,
 		 uint64_t rate_ns, uint64_t duration_ns)
 {
-	uint64_t start_ns, last_event_ns;
+	uint64_t start_ns, last_event_ns, target_ns;
 	uint32_t total_flip = 0, total_pass = 0;
 	bool front = false;
-	vtest_ns_t vtest_ns = get_test_rate_ns(data, output);
+	vtest_ns_t vtest_ns = get_test_rate_ns(data->range);
 
-	/* Align with the vblank region to speed up convergence. */
-	last_event_ns = wait_for_vblank(data, pipe);
-	start_ns = get_time_ns();
+	/* Align with the flip completion event to speed up convergence. */
+	do_flip(data, &data->fb0);
+	start_ns = last_event_ns = target_ns = get_kernel_event_ns(data,
+							DRM_EVENT_FLIP_COMPLETE);
 
 	for (;;) {
-		uint64_t now_ns, event_ns, wait_ns, target_ns;
+		uint64_t event_ns, wait_ns;
 		int64_t diff_ns;
 
 		front = !front;
@@ -283,6 +308,9 @@ flip_and_measure(data_t *data, igt_output_t *output, enum pipe pipe,
 		 */
 		event_ns = get_kernel_event_ns(data, DRM_EVENT_FLIP_COMPLETE);
 
+		igt_debug("event_ns - last_event_ns: %"PRIu64"\n",
+						(event_ns - last_event_ns));
+
 		/*
 		 * Check if the difference between the two flip timestamps
 		 * was within the required threshold from the expected rate.
@@ -291,12 +319,11 @@ flip_and_measure(data_t *data, igt_output_t *output, enum pipe pipe,
 		 * difference between 144Hz and 143Hz which should give this
 		 * enough accuracy for most use cases.
 		 */
-		if ((rate_ns <= vtest_ns.min) && (rate_ns >= vtest_ns.max))
-			diff_ns = rate_ns - (event_ns - last_event_ns);
-		else if (rate_ns > vtest_ns.min)
-			diff_ns = vtest_ns.min - (event_ns - last_event_ns);
-		else if (rate_ns < vtest_ns.max)
-			diff_ns = vtest_ns.max - (event_ns - last_event_ns);
+		if ((rate_ns < vtest_ns.min) && (rate_ns >= vtest_ns.max))
+			diff_ns = rate_ns;
+		else
+			diff_ns = vtest_ns.max;
+		diff_ns -= event_ns - last_event_ns;
 
 		if (llabs(diff_ns) < 50000ll)
 			total_pass += 1;
@@ -304,24 +331,24 @@ flip_and_measure(data_t *data, igt_output_t *output, enum pipe pipe,
 		last_event_ns = event_ns;
 		total_flip += 1;
 
-		now_ns = get_time_ns();
-		if (now_ns - start_ns > duration_ns)
+		if (event_ns - start_ns > duration_ns)
 			break;
 
 		/*
 		 * Burn CPU until next timestamp, sleeping isn't accurate enough.
-		 * It's worth noting that the target timestamp is based on absolute
-		 * timestamp rather than a delta to avoid accumulation errors.
+		 * The target timestamp is based on the delta b/w event timestamps
+		 * and whatever the time left to reach the expected refresh rate.
 		 */
-		diff_ns = now_ns - start_ns;
+		diff_ns = event_ns - target_ns;
 		wait_ns = ((diff_ns + rate_ns - 1) / rate_ns) * rate_ns;
-		target_ns = start_ns + wait_ns - 10;
+		wait_ns -= diff_ns;
+		target_ns = event_ns + wait_ns;
 
-		while (get_time_ns() < target_ns);
+		while (get_time_ns() < target_ns - 10);
 	}
 
-	igt_info("Completed %u flips, %u were in threshold for %"PRIu64"ns.\n",
-		 total_flip, total_pass, rate_ns);
+	igt_info("Completed %u flips, %u were in threshold for (%llu Hz) %"PRIu64"ns.\n",
+		 total_flip, total_pass, (NSECS_PER_SEC/rate_ns), rate_ns);
 
 	return total_flip ? ((total_pass * 100) / total_flip) : 0;
 }
@@ -331,16 +358,19 @@ static void
 test_basic(data_t *data, enum pipe pipe, igt_output_t *output, uint32_t flags)
 {
 	uint32_t result;
-	vtest_ns_t vtest_ns = get_test_rate_ns(data, output);
-	range_t range = get_vrr_range(data, output);
-	uint64_t rate = vtest_ns.mid;
-
-	igt_info("VRR Test execution on %s, PIPE_%s\n",
-		 output->name, kmstest_pipe_name(pipe));
+	vtest_ns_t vtest_ns;
+	range_t range;
+	uint64_t rate;
 
 	prepare_test(data, output, pipe);
+	range = data->range;
+	vtest_ns = get_test_rate_ns(range);
+	rate = vtest_ns.mid;
 
-	set_vrr_on_pipe(data, pipe, 1);
+	igt_info("VRR Test execution on %s, PIPE_%s with VRR range: (%u-%u) Hz\n",
+		 output->name, kmstest_pipe_name(pipe), range.min, range.max);
+
+	set_vrr_on_pipe(data, pipe, true);
 
 	/*
 	 * Do a short run with VRR, but don't check the result.
@@ -373,40 +403,51 @@ test_basic(data_t *data, enum pipe pipe, igt_output_t *output, uint32_t flags)
 	 * if refresh_rate is 50Hz:
 	 *      Flip will happen right away so returned refresh rate is 50Hz.
 	 * if refresh_rate < 40Hz:
-	 *      Flip should happen at the vmax so the returned refresh rate
-	 *      would be 40Hz.
+	 *      h/w will terminate the vblank at Vmax which is obvious.
+	 *      So, vblank termination should happen at Vmax, and flip done at
+	 *      next Vmin.
 	 */
 	if (flags & TEST_FLIPLINE) {
-		rate = rate_from_refresh(range.min - 5);
-		result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
-		igt_assert_f(result > 75,
-			     "Refresh rate %"PRIu64"ns: Target VRR on threshold not reached, result was %u%%\n",
-			     rate, result);
-
 		rate = rate_from_refresh(range.max + 5);
 		result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
 		igt_assert_f(result > 75,
-			     "Refresh rate %"PRIu64"ns: Target VRR on threshold not reached, result was %u%%\n",
-			     rate, result);
+			     "Refresh rate (%u Hz) %"PRIu64"ns: Target VRR on threshold not reached, result was %u%%\n",
+			     (range.max + 5), rate, result);
 	}
 
+	if (flags & ~TEST_NEGATIVE) {
+		rate = vtest_ns.mid;
+		result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
+		igt_assert_f(result > 75,
+			     "Refresh rate (%u Hz) %"PRIu64"ns: Target VRR on threshold not reached, result was %u%%\n",
+			     ((range.max + range.min) / 2), rate, result);
+	}
+
+	if (flags & TEST_FLIPLINE) {
+		rate = rate_from_refresh(range.min - 5);
+		result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
+		igt_assert_f(result < 50,
+			     "Refresh rate (%u Hz) %"PRIu64"ns: Target VRR on threshold exceeded, result was %u%%\n",
+			     (range.min - 5), rate, result);
+	}
+
+	/*
+	 * If we request VRR on a non-VRR panel, it is unlikely to reject the
+	 * modeset. And the expected behavior is the same as disabling VRR on
+	 * a VRR capable panel.
+	 */
+	set_vrr_on_pipe(data, pipe, (flags & TEST_NEGATIVE)? true : false);
 	rate = vtest_ns.mid;
 	result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
-	igt_assert_f(result > 75,
-		     "Refresh rate %"PRIu64"ns: Target VRR on threshold not reached, result was %u%%\n",
-		     rate, result);
-
-	set_vrr_on_pipe(data, pipe, 0);
-	result = flip_and_measure(data, output, pipe, rate, TEST_DURATION_NS);
 	igt_assert_f(result < 10,
-		     "Refresh rate %"PRIu64"ns: Target VRR off threshold exceeded, result was %u%%\n",
-		     rate, result);
+		     "Refresh rate (%u Hz) %"PRIu64"ns: Target VRR %s threshold exceeded, result was %u%%\n",
+		     ((range.max + range.min) / 2), rate, (flags & TEST_NEGATIVE)? "on" : "off", result);
 
 	/* Clean-up */
 	igt_plane_set_fb(data->primary, NULL);
 	igt_output_set_pipe(output, PIPE_NONE);
-	igt_display_commit_atomic(&data->display,
-				  DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+	igt_output_override_mode(output, NULL);
+	igt_display_commit2(&data->display, COMMIT_ATOMIC);
 
 	igt_remove_fb(data->drm_fd, &data->fb1);
 	igt_remove_fb(data->drm_fd, &data->fb0);
@@ -417,7 +458,6 @@ static void
 run_vrr_test(data_t *data, test_t test, uint32_t flags)
 {
 	igt_output_t *output;
-	bool found = false;
 
 	for_each_connected_output(&data->display, output) {
 		enum pipe pipe;
@@ -425,16 +465,22 @@ run_vrr_test(data_t *data, test_t test, uint32_t flags)
 		if (!has_vrr(output))
 			continue;
 
-		for_each_pipe(&data->display, pipe)
+		/* For Negative tests, panel should be non-vrr. */
+		if ((flags & TEST_NEGATIVE) && vrr_capable(output))
+			continue;
+
+		if ((flags & ~TEST_NEGATIVE) && !vrr_capable(output))
+			continue;
+
+		for_each_pipe(&data->display, pipe) {
 			if (igt_pipe_connector_valid(pipe, output)) {
-				test(data, pipe, output, flags);
-				found = true;
+				igt_dynamic_f("pipe-%s-%s",
+					      kmstest_pipe_name(pipe), output->name)
+					test(data, pipe, output, flags);
 				break;
 			}
+		}
 	}
-
-	if (!found)
-		igt_skip("No vrr capable outputs found.\n");
 }
 
 igt_main
@@ -451,18 +497,28 @@ igt_main
 		igt_display_require_output(&data.display);
 	}
 
-	igt_subtest("flip-basic")
-		run_vrr_test(&data, test_basic, 0);
+	igt_describe("Tests that VRR is enabled and that the difference between flip "
+		     "timestamps converges to the requested rate");
+	igt_subtest_with_dynamic("flip-basic")
+		run_vrr_test(&data, test_basic, TEST_BASIC);
 
-	igt_subtest("flip-dpms")
+	igt_describe("Tests with DPMS that VRR is enabled and that the difference between flip "
+		     "timestamps converges to the requested rate.");
+	igt_subtest_with_dynamic("flip-dpms")
 		run_vrr_test(&data, test_basic, TEST_DPMS);
 
-	igt_subtest("flip-suspend")
+	igt_describe("Tests that VRR is enabled and that the difference between flip "
+		     "timestamps converges to the requested rate in a suspend test");
+	igt_subtest_with_dynamic("flip-suspend")
 		run_vrr_test(&data, test_basic, TEST_SUSPEND);
 
 	igt_describe("Make sure that flips happen at flipline decision boundary.");
-	igt_subtest("flipline")
+	igt_subtest_with_dynamic("flipline")
 		run_vrr_test(&data, test_basic, TEST_FLIPLINE);
+
+	igt_describe("Make sure that VRR should not be enabled on the Non-VRR panel.");
+	igt_subtest_with_dynamic("negative-basic")
+		run_vrr_test(&data, test_basic, TEST_NEGATIVE);
 
 	igt_fixture {
 		igt_display_fini(&data.display);

@@ -18,10 +18,9 @@
 #include "sync_file.h"
 
 #include "i915/gem.h"
-#include "i915/gem_ring.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_rand.h"
-#include "igt_rapl.h"
 #include "igt_sysfs.h"
 #include "igt_syncobj.h"
 #include "igt_vgem.h"
@@ -31,6 +30,35 @@
 IGT_TEST_DESCRIPTION("Check that GPU time and execution order is fairly distributed across clients");
 
 #define NSEC64 ((uint64_t)NSEC_PER_SEC)
+
+static int has_secure_batches(int i915)
+{
+	int v = -1;
+	drm_i915_getparam_t gp = {
+		.param = I915_PARAM_HAS_SECURE_BATCHES,
+		.value = &v,
+	};
+
+	drmIoctl(i915, DRM_IOCTL_I915_GETPARAM, &gp);
+
+	return v > 0;
+}
+
+static bool has_mi_math(int i915, const struct intel_execution_engine2 *e)
+{
+	uint32_t devid = intel_get_drm_devid(i915);
+
+	if (intel_gen(devid) >= 8)
+		return true;
+
+	if (!IS_HASWELL(devid))
+		return false;
+
+	if (!has_secure_batches(i915))
+		return false;
+
+	return e == NULL || e->class == I915_ENGINE_CLASS_RENDER;
+}
 
 static unsigned int offset_in_page(void *addr)
 {
@@ -69,16 +97,11 @@ static uint64_t div64_u64_round_up(uint64_t x, uint64_t y)
 	return (x + y - 1) / y;
 }
 
-static bool is_icelake(int i915)
-{
-	return intel_get_device_info(intel_get_drm_devid(i915))->is_icelake;
-}
-
 static uint64_t ns_to_ctx_ticks(int i915, uint64_t ns)
 {
 	int f = read_timestamp_frequency(i915);
-	if (is_icelake(i915))
-		f = 12500000; /* icl!!! are you feeling alright? CTX vs CS */
+	if (intel_gen(intel_get_drm_devid(i915)) == 11)
+		f = 12500000; /* gen11!!! are you feeling alright? CTX vs CS */
 	return div64_u64_round_up(ns * f, NSEC64);
 }
 
@@ -88,33 +111,6 @@ static uint64_t ticks_to_ns(int i915, uint64_t ticks)
 				  read_timestamp_frequency(i915));
 }
 
-#define MI_INSTR(opcode, flags) (((opcode) << 23) | (flags))
-
-#define MI_MATH(x)                      MI_INSTR(0x1a, (x) - 1)
-#define MI_MATH_INSTR(opcode, op1, op2) ((opcode) << 20 | (op1) << 10 | (op2))
-/* Opcodes for MI_MATH_INSTR */
-#define   MI_MATH_NOOP                  MI_MATH_INSTR(0x000, 0x0, 0x0)
-#define   MI_MATH_LOAD(op1, op2)        MI_MATH_INSTR(0x080, op1, op2)
-#define   MI_MATH_LOADINV(op1, op2)     MI_MATH_INSTR(0x480, op1, op2)
-#define   MI_MATH_LOAD0(op1)            MI_MATH_INSTR(0x081, op1)
-#define   MI_MATH_LOAD1(op1)            MI_MATH_INSTR(0x481, op1)
-#define   MI_MATH_ADD                   MI_MATH_INSTR(0x100, 0x0, 0x0)
-#define   MI_MATH_SUB                   MI_MATH_INSTR(0x101, 0x0, 0x0)
-#define   MI_MATH_AND                   MI_MATH_INSTR(0x102, 0x0, 0x0)
-#define   MI_MATH_OR                    MI_MATH_INSTR(0x103, 0x0, 0x0)
-#define   MI_MATH_XOR                   MI_MATH_INSTR(0x104, 0x0, 0x0)
-#define   MI_MATH_STORE(op1, op2)       MI_MATH_INSTR(0x180, op1, op2)
-#define   MI_MATH_STOREINV(op1, op2)    MI_MATH_INSTR(0x580, op1, op2)
-/* Registers used as operands in MI_MATH_INSTR */
-#define   MI_MATH_REG(x)                (x)
-#define   MI_MATH_REG_SRCA              0x20
-#define   MI_MATH_REG_SRCB              0x21
-#define   MI_MATH_REG_ACCU              0x31
-#define   MI_MATH_REG_ZF                0x32
-#define   MI_MATH_REG_CF                0x33
-
-#define MI_LOAD_REGISTER_REG    MI_INSTR(0x2A, 1)
-
 static void delay(int i915,
 		  const struct intel_execution_engine2 *e,
 		  uint32_t handle,
@@ -123,12 +119,13 @@ static void delay(int i915,
 {
 	const int use_64b = intel_gen(intel_get_drm_devid(i915)) >= 8;
 	const uint32_t base = gem_engine_mmio_base(i915, e->name);
+	const uint32_t runtime = base + (use_64b ? 0x3a8 : 0x358);
 #define CS_GPR(x) (base + 0x600 + 8 * (x))
-#define RUNTIME (base + 0x3a8)
 	enum { START_TS, NOW_TS };
 	uint32_t *map, *cs, *jmp;
 
 	igt_require(base);
+	igt_assert(use_64b || (addr >> 32) == 0);
 
 	/* Loop until CTX_TIMESTAMP - initial > @ns */
 
@@ -138,7 +135,7 @@ static void delay(int i915,
 	*cs++ = CS_GPR(START_TS) + 4;
 	*cs++ = 0;
 	*cs++ = MI_LOAD_REGISTER_REG;
-	*cs++ = RUNTIME;
+	*cs++ = runtime;
 	*cs++ = CS_GPR(START_TS);
 
 	while (offset_in_page(cs) & 63)
@@ -151,7 +148,7 @@ static void delay(int i915,
 	*cs++ = CS_GPR(NOW_TS) + 4;
 	*cs++ = 0;
 	*cs++ = MI_LOAD_REGISTER_REG;
-	*cs++ = RUNTIME;
+	*cs++ = runtime;
 	*cs++ = CS_GPR(NOW_TS);
 
 	/* delta = now - start; inverted to match COND_BBE */
@@ -195,7 +192,7 @@ static void delay(int i915,
 }
 
 static struct drm_i915_gem_exec_object2
-delay_create(int i915, uint32_t ctx,
+delay_create(int i915, const intel_ctx_t *ctx,
 	     const struct intel_execution_engine2 *e,
 	     uint64_t target_ns)
 {
@@ -206,7 +203,7 @@ delay_create(int i915, uint32_t ctx,
 	struct drm_i915_gem_execbuffer2 execbuf = {
 		.buffers_ptr = to_user_pointer(&obj),
 		.buffer_count = 1,
-		.rsvd1 = ctx,
+		.rsvd1 = ctx->id,
 		.flags = e->flags,
 	};
 
@@ -234,6 +231,7 @@ static void tslog(int i915,
 	uint32_t *map, *cs;
 
 	igt_require(base);
+	igt_assert(use_64b || (addr >> 32) == 0);
 
 	map = gem_mmap__device_coherent(i915, handle, 0, 4096, PROT_WRITE);
 	cs = map + 512;
@@ -295,7 +293,8 @@ static void tslog(int i915,
 }
 
 static struct drm_i915_gem_exec_object2
-tslog_create(int i915, uint32_t ctx, const struct intel_execution_engine2 *e)
+tslog_create(int i915, const intel_ctx_t *ctx,
+	     const struct intel_execution_engine2 *e)
 {
 	struct drm_i915_gem_exec_object2 obj = {
 		.handle = batch_create(i915),
@@ -304,7 +303,7 @@ tslog_create(int i915, uint32_t ctx, const struct intel_execution_engine2 *e)
 	struct drm_i915_gem_execbuffer2 execbuf = {
 		.buffers_ptr = to_user_pointer(&obj),
 		.buffer_count = 1,
-		.rsvd1 = ctx,
+		.rsvd1 = ctx->id,
 		.flags = e->flags,
 	};
 
@@ -330,23 +329,93 @@ static int cmp_u32(const void *A, const void *B)
 		return 0;
 }
 
-static bool has_ctx_timestamp(int i915, const struct intel_execution_engine2 *e)
+static uint32_t
+read_ctx_timestamp(int i915, const intel_ctx_t *ctx,
+		   const struct intel_execution_engine2 *e)
+{
+	struct drm_i915_gem_relocation_entry reloc;
+	struct drm_i915_gem_exec_object2 obj = {
+		.handle = gem_create(i915, 4096),
+		.offset = 32 << 20,
+		.relocs_ptr = to_user_pointer(&reloc),
+		.relocation_count = 1,
+	};
+	struct drm_i915_gem_execbuffer2 execbuf = {
+		.buffers_ptr = to_user_pointer(&obj),
+		.buffer_count = 1,
+		.rsvd1 = ctx->id,
+		.flags = e->flags,
+	};
+	const int use_64b = intel_gen(intel_get_drm_devid(i915)) >= 8;
+	const uint32_t base = gem_engine_mmio_base(i915, e->name);
+	const uint32_t runtime = base + (use_64b ? 0x3a8 : 0x358);
+	uint32_t *map, *cs;
+	uint32_t ts;
+	bool has_relocs = gem_has_relocations(i915);
+
+	cs = map = gem_mmap__device_coherent(i915, obj.handle,
+					     0, 4096, PROT_WRITE);
+
+	*cs++ = 0x24 << 23 | (1 + use_64b); /* SRM */
+	*cs++ = runtime;
+
+	memset(&reloc, 0, sizeof(reloc));
+	reloc.target_handle = obj.handle;
+	reloc.presumed_offset = obj.offset;
+	reloc.offset = offset_in_page(cs);
+	reloc.delta = 4000;
+	*cs++ = obj.offset + 4000;
+	*cs++ = obj.offset >> 32;
+
+	*cs++ = MI_BATCH_BUFFER_END;
+
+	if (!has_relocs) {
+		obj.relocation_count = 0;
+		obj.flags |= EXEC_OBJECT_PINNED;
+	}
+
+	gem_execbuf(i915, &execbuf);
+	gem_sync(i915, obj.handle);
+	ts = map[1000];
+
+	if (!ts) {
+		/* Twice for good luck (and avoid chance 0) */
+		gem_execbuf(i915, &execbuf);
+		gem_sync(i915, obj.handle);
+		ts = map[1000];
+	}
+
+	gem_close(i915, obj.handle);
+	munmap(map, 4096);
+
+	return ts;
+}
+
+static bool has_ctx_timestamp(int i915, const intel_ctx_cfg_t *cfg,
+			      const struct intel_execution_engine2 *e)
 {
 	const int gen = intel_gen(intel_get_drm_devid(i915));
+	const intel_ctx_t *tmp_ctx;
+	uint32_t timestamp;
 
 	if (gen == 8 && e->class == I915_ENGINE_CLASS_VIDEO)
 		return false; /* looks fubar */
 
-	return true;
+	tmp_ctx = intel_ctx_create(i915, cfg);
+	timestamp = read_ctx_timestamp(i915, tmp_ctx, e);
+	intel_ctx_destroy(i915, tmp_ctx);
+
+	return timestamp;
 }
 
 static struct intel_execution_engine2
-pick_random_engine(int i915, const struct intel_execution_engine2 *not)
+pick_random_engine(int i915, const intel_ctx_cfg_t *cfg,
+		   const struct intel_execution_engine2 *not)
 {
 	const struct intel_execution_engine2 *e;
 	unsigned int count = 0;
 
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_cfg_engine(i915, cfg, e) {
 		if (e->flags == not->flags)
 			continue;
 		if (!gem_class_has_mutable_submission(i915, e->class))
@@ -357,7 +426,7 @@ pick_random_engine(int i915, const struct intel_execution_engine2 *not)
 		return *not;
 
 	count = rand() % count;
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_cfg_engine(i915, cfg, e) {
 		if (e->flags == not->flags)
 			continue;
 		if (!gem_class_has_mutable_submission(i915, e->class))
@@ -369,7 +438,7 @@ pick_random_engine(int i915, const struct intel_execution_engine2 *not)
 	return *e;
 }
 
-static void fair_child(int i915, uint32_t ctx,
+static void fair_child(int i915, const intel_ctx_t *ctx,
 		       const struct intel_execution_engine2 *e,
 		       uint64_t frame_ns,
 		       int timeline,
@@ -405,11 +474,12 @@ static void fair_child(int i915, uint32_t ctx,
 	struct intel_execution_engine2 ping = *e;
 	int p_fence = -1, n_fence = -1;
 	unsigned long count = 0;
+	unsigned int aux_flags;
 	int n;
 
 	srandom(getpid());
 	if (flags & F_PING)
-		ping = pick_random_engine(i915, e);
+		ping = pick_random_engine(i915, &ctx->cfg, e);
 	obj[0] = tslog_create(i915, ctx, &ping);
 
 	/* Synchronize with other children/parent upon construction */
@@ -419,13 +489,19 @@ static void fair_child(int i915, uint32_t ctx,
 		read(rv, &p_fence, sizeof(p_fence));
 	igt_assert(p_fence == -1);
 
+	aux_flags = 0;
+	if (intel_gen(intel_get_drm_devid(i915)) < 8)
+		aux_flags = I915_EXEC_SECURE;
+	ping.flags |= aux_flags;
+	aux_flags |= e->flags;
+
 	while (!READ_ONCE(*ctl)) {
 		struct drm_i915_gem_execbuffer2 execbuf = {
 			.buffers_ptr = to_user_pointer(obj),
 			.buffer_count = 3,
-			.rsvd1 = ctx,
+			.rsvd1 = ctx->id,
 			.rsvd2 = -1,
-			.flags = e->flags,
+			.flags = aux_flags,
 		};
 
 		if (flags & F_FLOW) {
@@ -500,7 +576,8 @@ static void fair_child(int i915, uint32_t ctx,
 
 		map = gem_mmap__device_coherent(i915, obj[0].handle,
 						0, 4096, PROT_WRITE);
-		for (n = 1; n < min(count, 512); n++) {
+		igt_assert(map[0]);
+		for (n = 1; n < min(count, 512ul); n++) {
 			igt_assert(map[n]);
 			map[n - 1] = map[n] - map[n - 1];
 		}
@@ -544,7 +621,7 @@ static void timeline_advance(int timeline, int delay_ns)
 	sw_sync_timeline_inc(timeline, 1);
 }
 
-static void fairness(int i915,
+static void fairness(int i915, const intel_ctx_cfg_t *cfg,
 		     const struct intel_execution_engine2 *e,
 		     int duration, unsigned int flags)
 {
@@ -557,8 +634,10 @@ static void fairness(int i915,
 		int parent[2];
 	} lnk;
 
-	igt_require(has_ctx_timestamp(i915, e));
+	igt_require(has_ctx_timestamp(i915, cfg, e));
 	igt_require(gem_class_has_mutable_submission(i915, e->class));
+	if (flags & (F_ISOLATE | F_PING))
+		igt_require(intel_gen(intel_get_drm_devid(i915)) >= 8);
 
 	igt_assert(pipe(lnk.child) == 0);
 	igt_assert(pipe(lnk.parent) == 0);
@@ -619,12 +698,12 @@ static void fairness(int i915,
 		if (flags & F_PING) { /* fill the others with light bg load */
 			struct intel_execution_engine2 *ping;
 
-			__for_each_physical_engine(i915, ping) {
+			for_each_ctx_cfg_engine(i915, cfg, ping) {
 				if (ping->flags == e->flags)
 					continue;
 
 				igt_fork(child, 1) {
-					uint32_t ctx = gem_context_clone_with_engines(i915, 0);
+					const intel_ctx_t *ctx = intel_ctx_create(i915, cfg);
 
 					fair_child(i915, ctx, ping,
 						   child_ns / 8,
@@ -633,7 +712,7 @@ static void fairness(int i915,
 						   &result[nchild],
 						   NULL, NULL, -1, -1);
 
-					gem_context_destroy(i915, ctx);
+					intel_ctx_destroy(i915, ctx);
 				}
 			}
 		}
@@ -641,26 +720,24 @@ static void fairness(int i915,
 		getrusage(RUSAGE_CHILDREN, &old_usage);
 		igt_nsec_elapsed(memset(&tv, 0, sizeof(tv)));
 		igt_fork(child, nchild) {
-			uint32_t ctx;
+			const intel_ctx_t *ctx;
 
 			if (flags & F_ISOLATE) {
-				int clone, dmabuf = -1;
+				int dmabuf = -1;
 
 				if (common)
 					dmabuf = prime_handle_to_fd(i915, common);
 
-				clone = gem_reopen_driver(i915);
-				gem_context_copy_engines(i915, 0, clone, 0);
-				i915 = clone;
+				i915 = gem_reopen_driver(i915);
 
 				if (dmabuf != -1)
 					common = prime_fd_to_handle(i915, dmabuf);
 			}
 
-			ctx = gem_context_clone_with_engines(i915, 0);
+			ctx = intel_ctx_create(i915, cfg);
 
 			if (flags & F_VIP && child == 0) {
-				gem_context_set_priority(i915, ctx, 1023);
+				gem_context_set_priority(i915, ctx->id, 1023);
 				flags |= F_FLOW;
 			}
 			if (flags & F_RRUL && child == 0)
@@ -672,7 +749,7 @@ static void fairness(int i915,
 				   &result[child], &iqr[child],
 				   lnk.child[1], lnk.parent[0]);
 
-			gem_context_destroy(i915, ctx);
+			intel_ctx_destroy(i915, ctx);
 		}
 
 		{
@@ -817,7 +894,7 @@ static void fairness(int i915,
 }
 
 static void deadline_child(int i915,
-			   uint32_t ctx,
+			   const intel_ctx_t *ctx,
 			   const struct intel_execution_engine2 *e,
 			   uint32_t handle,
 			   int timeline,
@@ -836,26 +913,35 @@ static void deadline_child(int i915,
 	struct drm_i915_gem_execbuffer2 execbuf = {
 		.buffers_ptr = to_user_pointer(obj),
 		.buffer_count = ARRAY_SIZE(obj),
-		.num_cliprects = 1,
-		.cliprects_ptr = to_user_pointer(&fence),
-		.rsvd1 = ctx,
-		.flags = ((flags & DL_PRIO ? 0 : I915_EXEC_FENCE_IN) |
-			  I915_EXEC_FENCE_ARRAY |
-			  I915_EXEC_FENCE_OUT |
-			  e->flags),
+		.flags = I915_EXEC_FENCE_OUT | e->flags,
+		.rsvd1 = ctx->id,
 	};
 	unsigned int seq = 1;
 	int prev = -1, next = -1;
+
+	if (intel_gen(intel_get_drm_devid(i915)) < 8)
+		execbuf.flags |= I915_EXEC_SECURE;
+
+	gem_execbuf_wr(i915, &execbuf);
+	execbuf.rsvd2 >>= 32;
+	gem_execbuf_wr(i915, &execbuf);
+	gem_sync(i915, obj[1].handle);
+
+	execbuf.num_cliprects = 1;
+	execbuf.cliprects_ptr = to_user_pointer(&fence);
+	execbuf.flags |= I915_EXEC_FENCE_ARRAY;
+	if (!(flags & DL_PRIO))
+		execbuf.flags |= I915_EXEC_FENCE_IN;
 
 	write(sv, &prev, sizeof(int));
 	read(rv, &prev, sizeof(int));
 	igt_assert(prev == -1);
 
+	prev = execbuf.rsvd2;
+	next = execbuf.rsvd2 >> 32;
 	while (!READ_ONCE(*done)) {
-		if (prev != -1) {
-			sync_fence_wait(prev, -1);
-			igt_assert_eq(sync_fence_status(prev), 1);
-		}
+		sync_fence_wait(prev, -1);
+		igt_assert_eq(sync_fence_status(prev), 1);
 		close(prev);
 
 		fence.handle = syncobj_create(i915, 0);
@@ -873,11 +959,12 @@ static void deadline_child(int i915,
 	close(prev);
 }
 
-static struct intel_execution_engine2 pick_default(int i915)
+static struct intel_execution_engine2
+pick_default(int i915, const intel_ctx_cfg_t *cfg)
 {
 	const struct intel_execution_engine2 *e;
 
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_cfg_engine(i915, cfg, e) {
 		if (!e->flags)
 			return *e;
 	}
@@ -885,11 +972,12 @@ static struct intel_execution_engine2 pick_default(int i915)
 	return (struct intel_execution_engine2){};
 }
 
-static struct intel_execution_engine2 pick_engine(int i915, const char *name)
+static struct intel_execution_engine2
+pick_engine(int i915, const intel_ctx_cfg_t *cfg, const char *name)
 {
 	const struct intel_execution_engine2 *e;
 
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_cfg_engine(i915, cfg, e) {
 		if (!strcmp(e->name, name))
 			return *e;
 	}
@@ -926,15 +1014,16 @@ static uint64_t time_get_mono_ns(void)
 	return tv.tv_sec * NSEC64 + tv.tv_nsec;
 }
 
-static void deadline(int i915, int duration, unsigned int flags)
+static void deadline(int i915, const intel_ctx_cfg_t *cfg,
+		     int duration, unsigned int flags)
 {
 	const int64_t frame_ns = 33670 * 1000; /* 29.7fps */
 	const int64_t parent_ns = 400 * 1000;
 	const int64_t switch_ns = 50 * 1000;
 	const int64_t overhead_ns = /* estimate timeslicing overhead */
 		(frame_ns / 1000 / 1000 + 2) * switch_ns + parent_ns;
-	struct intel_execution_engine2 pe = pick_default(i915);
-	struct intel_execution_engine2 ve = pick_engine(i915, "vcs0");
+	struct intel_execution_engine2 pe = pick_default(i915, cfg);
+	struct intel_execution_engine2 ve = pick_engine(i915, cfg, "vcs0");
 	struct drm_i915_gem_exec_fence *fences = calloc(sizeof(*fences), 32);
 	struct drm_i915_gem_exec_object2 *obj = calloc(sizeof(*obj), 32);
 	struct drm_i915_gem_execbuffer2 execbuf = {
@@ -945,10 +1034,15 @@ static void deadline(int i915, int duration, unsigned int flags)
 			I915_EXEC_FENCE_ARRAY |
 			I915_EXEC_FENCE_OUT
 	};
+	const intel_ctx_t *delay_ctx;
 	int *ctl;
 
 	igt_require(has_syncobj(i915));
 	igt_require(has_fence_array(i915));
+	igt_require(has_mi_math(i915, &pe));
+	igt_require(has_ctx_timestamp(i915, cfg, &pe));
+	igt_require(has_mi_math(i915, &ve));
+	igt_require(has_ctx_timestamp(i915, cfg, &ve));
 	igt_assert(obj && fences);
 	if (flags & DL_PRIO)
 		igt_require(gem_scheduler_has_preemption(i915));
@@ -956,9 +1050,12 @@ static void deadline(int i915, int duration, unsigned int flags)
 	ctl = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	igt_assert(ctl != MAP_FAILED);
 
-	obj[0] = delay_create(i915, 0, &pe, parent_ns);
+	delay_ctx = intel_ctx_create(i915, cfg);
+	obj[0] = delay_create(i915, delay_ctx, &pe, parent_ns);
 	if (flags & DL_PRIO)
-		gem_context_set_priority(i915, 0, 1023);
+		gem_context_set_priority(i915, delay_ctx->id, 1023);
+	if (intel_gen(intel_get_drm_devid(i915)) < 8)
+		execbuf.flags |= I915_EXEC_SECURE;
 	for (int n = 1; n <= 5; n++) {
 		int timeline = sw_sync_timeline_create();
 		int nframes = duration * NSEC64 / frame_ns + 1;
@@ -983,7 +1080,7 @@ static void deadline(int i915, int duration, unsigned int flags)
 
 		*ctl = 0;
 		igt_fork(child, num_children) {
-			uint32_t ctx = gem_context_clone_with_engines(i915, 0);
+			const intel_ctx_t *ctx = intel_ctx_create(i915, cfg);
 
 			deadline_child(i915, ctx, &ve, obj[child + 1].handle,
 				       timeline, child_ns,
@@ -991,7 +1088,7 @@ static void deadline(int i915, int duration, unsigned int flags)
 				       link[child].parent[0],
 				       ctl, flags);
 
-			gem_context_destroy(i915, ctx);
+			intel_ctx_destroy(i915, ctx);
 		}
 
 		for (int i = 0; i < num_children; i++)
@@ -1065,9 +1162,28 @@ static void deadline(int i915, int duration, unsigned int flags)
 		gem_quiescent_gpu(i915);
 	}
 
+	intel_ctx_destroy(i915, delay_ctx);
 	gem_close(i915, obj[0].handle);
 	free(obj);
 	free(fences);
+}
+
+static bool set_heartbeat(int i915, const char *name, unsigned int value)
+{
+	unsigned int x;
+
+	if (gem_engine_property_printf(i915, name,
+				       "heartbeat_interval_ms",
+				       "%d", value) < 0)
+		return false;
+
+	x = ~value;
+	gem_engine_property_scanf(i915, name,
+				  "heartbeat_interval_ms",
+				  "%d", &x);
+	igt_assert_eq(x, value);
+
+	return true;
 }
 
 igt_main
@@ -1154,6 +1270,7 @@ igt_main
 		{}
 	};
 	const struct intel_execution_engine2 *e;
+	intel_ctx_cfg_t cfg;
 	int i915 = -1;
 
 	igt_fixture {
@@ -1169,9 +1286,17 @@ igt_main
 		igt_require(gem_scheduler_enabled(i915));
 		igt_require(gem_scheduler_has_ctx_priority(i915));
 
+		/*
+		 * These tests are for a specific scheduling model which is
+		 * not currently implemented by GuC. So skip on GuC platforms.
+		 */
+		igt_require(!gem_using_guc_submission(i915));
+
+		cfg = intel_ctx_cfg_all_physical(i915);
+
 		igt_info("CS timestamp frequency: %d\n",
 			 read_timestamp_frequency(i915));
-		igt_require(intel_gen(intel_get_drm_devid(i915)) >= 8);
+		igt_require(has_mi_math(i915, NULL));
 
 		igt_fork_hang_detector(i915);
 	}
@@ -1182,7 +1307,10 @@ igt_main
 			continue;
 
 		igt_subtest_with_dynamic_f("basic-%s", f->name)  {
-			__for_each_physical_engine(i915, e) {
+			for_each_ctx_cfg_engine(i915, &cfg, e) {
+				if (!has_mi_math(i915, e))
+					continue;
+
 				if (!gem_class_can_store_dword(i915, e->class))
 					continue;
 
@@ -1190,24 +1318,30 @@ igt_main
 					continue;
 
 				igt_dynamic_f("%s", e->name)
-					fairness(i915, e, 1, f->flags);
+					fairness(i915, &cfg, e, 1, f->flags);
 			}
 		}
 	}
 
 	igt_subtest("basic-deadline")
-		deadline(i915, 2, 0);
+		deadline(i915, &cfg, 2, 0);
 	igt_subtest("deadline-prio")
-		deadline(i915, 2, DL_PRIO);
+		deadline(i915, &cfg, 2, DL_PRIO);
 
 	for (typeof(*fair) *f = fair; f->name; f++) {
 		igt_subtest_with_dynamic_f("fair-%s", f->name)  {
-			__for_each_physical_engine(i915, e) {
+			for_each_ctx_cfg_engine(i915, &cfg, e) {
+				if (!has_mi_math(i915, e))
+					continue;
+
 				if (!gem_class_can_store_dword(i915, e->class))
 					continue;
 
+				if (!set_heartbeat(i915, e->name, 5000))
+					continue;
+
 				igt_dynamic_f("%s", e->name)
-					fairness(i915, e, 5, f->flags);
+					fairness(i915, &cfg, e, 5, f->flags);
 			}
 		}
 	}

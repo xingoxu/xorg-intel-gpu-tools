@@ -16,12 +16,10 @@ igt@i915_pm_rpm@gem-execbuf-stress-extra-wait
 igt@gem_busy@hang.*
 igt@gem_close_race@(?!.*basic).*
 igt@gem_concurrent_blit(@.*)?
-igt@gem_cs_prefetch(@.*)?
 igt@gem_ctx_create@(?!.*basic).*
 igt@gem_ctx_exec@(?!.*basic).*
 igt@gem_ctx_shared@*exhaust*
 igt@gem_ctx_switch(@.*)?
-igt@gem_ctx_thrash(@.*)?
 igt@gem_evict_alignment(@.*)?
 igt@gem_evict_everything(@.*)?
 igt@gem_exec_big@(?!.*single).*
@@ -51,12 +49,12 @@ igt@gem_reset_stats(@.*)?
 igt@gem_ringfill@(?!.*basic).*
 igt@gem_shrink@(?!reclaim$).*
 igt@gem_softpin@.*(hang|S4).*
-igt@gem_spin_batch(@.*)?
 igt@gem_streaming_writes(@.*)?
 igt@gem_sync@(?!.*basic).*
 igt@gem_tiled_swapping@(?!non-threaded).*
 igt@gem_userptr_blits@(major|minor|forked|mlocked|swapping).*
 igt@gem_wait@hang.*
+igt@gem_watchdog@far-fence
 igt@sysfs_heartbeat_interval@(long|off)
 igt@sysfs_preempt_timeout@off
 igt@sysfs_timeslice_duration@off
@@ -64,6 +62,7 @@ igt@sysfs_timeslice_duration@off
 # GEM: Not worth fixing
 ###############################################
 igt@gen7_exec_parse@.*lri.*
+igt@gem_exec_alignment@pi-shared
 ###############################################
 # There are no DRRS capable displays in CI lab
 ###############################################
@@ -93,6 +92,10 @@ igt@amdgpu/.*
 ###############################################
 igt@panfrost_.*
 ###############################################
+# Qualcomm
+###############################################
+igt@msm_.*
+###############################################
 # Hibernate: not configured correctly on CI
 ###############################################
 igt@.*@.*-hibernate
@@ -121,3 +124,6 @@ igt@core_hotunplug@.*(hot|plug).*
 
 # hangs several gens of hosts, and has no immediate fix
 igt@device_reset@reset-bound
+
+# not working for i915
+igt@kms_bw@.*

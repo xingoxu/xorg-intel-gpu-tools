@@ -11,6 +11,7 @@ benchmark_progs = [
 	'gem_prw',
 	'gem_set_domain',
 	'gem_syslatency',
+	'gem_userptr_benchmark',
 	'gem_wsim',
 	'kms_vblank',
 	'prime_lookup',
@@ -23,7 +24,6 @@ if libdrm_intel.found()
 		'intel_upload_blit_large_gtt',
 		'intel_upload_blit_large_map',
 		'intel_upload_blit_small',
-		'gem_userptr_benchmark',
 	]
 endif
 
@@ -35,3 +35,11 @@ foreach prog : benchmark_progs
 		   install_dir : benchmarksdir,
 		   dependencies : igt_deps)
 endforeach
+
+lib_gem_exec_tracer = shared_module(
+  'gem_exec_tracer',
+  'gem_exec_tracer.c',
+  dependencies : dlsym,
+  include_directories : inc,
+  install_dir : benchmarksdir,
+  install: true)

@@ -45,13 +45,14 @@ oa_report_ctx_is_valid(const struct intel_perf_devinfo *devinfo,
 {
 	const uint32_t *report = (const uint32_t *) _report;
 
-	if (devinfo->gen < 8) {
+	if (devinfo->graphics_ver < 8)
 		return false; /* TODO */
-	} else if (devinfo->gen == 8) {
+	if (devinfo->graphics_ver >= 12)
+		return true; /* Always valid */
+	if (devinfo->graphics_ver == 8)
 		return report[0] & (1ul << 25);
-	} else if (devinfo->gen > 8) {
+	if (devinfo->graphics_ver > 8)
 		return report[0] & (1ul << 16);
-	}
 
 	return false;
 }
@@ -62,12 +63,6 @@ oa_report_ctx_id(const struct intel_perf_devinfo *devinfo, const uint8_t *report
 	if (!oa_report_ctx_is_valid(devinfo, report))
 		return 0xffffffff;
 	return ((const uint32_t *) report)[2];
-}
-
-static inline uint64_t
-oa_report_timestamp(const uint8_t *report)
-{
-	return ((const uint32_t *)report)[1];
 }
 
 static void
@@ -117,23 +112,11 @@ find_metric_set(struct intel_perf *perf, const char *symbol_name)
 	return NULL;
 }
 
-static void
-init_devinfo(struct intel_perf_devinfo *perf_devinfo,
-	     const struct intel_device_info *devinfo,
-	     uint32_t devid,
-	     uint64_t timestamp_frequency)
-{
-	perf_devinfo->devid = devid;
-	perf_devinfo->gen = devinfo->gen;
-	perf_devinfo->timestamp_frequency = timestamp_frequency;
-}
-
 static bool
 parse_data(struct intel_perf_data_reader *reader)
 {
 	const struct intel_perf_record_device_info *record_info;
 	const struct intel_perf_record_device_topology *record_topology;
-	const struct intel_device_info *devinfo;
 	const uint8_t *end = reader->mmap_data + reader->mmap_size;
 	const uint8_t *iter = reader->mmap_data;
 
@@ -195,23 +178,20 @@ parse_data(struct intel_perf_data_reader *reader)
 	record_info = reader->record_info;
 	record_topology = reader->record_topology;
 
-	devinfo = intel_get_device_info(record_info->device_id);
-	if (!devinfo) {
-		snprintf(reader->error_msg, sizeof(reader->error_msg),
-			 "Recording occured on unsupported device (0x%x)",
-			 record_info->device_id);
-		return false;
-	}
-
-	init_devinfo(&reader->devinfo, devinfo,
-		     record_info->device_id,
-		     record_info->timestamp_frequency);
 	reader->perf = intel_perf_for_devinfo(record_info->device_id,
 					      record_info->device_revision,
 					      record_info->timestamp_frequency,
 					      record_info->gt_min_frequency,
 					      record_info->gt_max_frequency,
 					      &record_topology->topology);
+	if (!reader->perf) {
+		snprintf(reader->error_msg, sizeof(reader->error_msg),
+			 "Recording occured on unsupported device (0x%x)",
+			 record_info->device_id);
+		return false;
+	}
+
+	reader->devinfo = reader->perf->devinfo;
 
 	reader->metric_set_name = record_info->metric_set_name;
 	reader->metric_set_uuid = record_info->metric_set_uuid;
@@ -229,7 +209,7 @@ correlate_gpu_timestamp(struct intel_perf_data_reader *reader,
 	 * Try to figure what portion of the correlation data the
 	 * 32bit timestamp belongs to.
 	 */
-	uint64_t mask = 0xffffffff;
+	uint64_t mask = reader->perf->devinfo.oa_timestamp_mask;
 	int corr_idx = -1;
 
 	for (uint32_t i = 0; i < reader->n_correlation_chunks; i++) {
@@ -297,17 +277,27 @@ static void
 generate_cpu_events(struct intel_perf_data_reader *reader)
 {
 	uint32_t last_header_idx = 0;
-	const struct drm_i915_perf_record_header *last_header = reader->records[0];
+	const struct drm_i915_perf_record_header *last_header = reader->records[0],
+		*current_header = reader->records[0];
+	const uint8_t *start_report, *end_report;
+	uint32_t last_ctx_id, current_ctx_id;
+	uint64_t gpu_ts_start, gpu_ts_end;
 
 	for (uint32_t i = 1; i < reader->n_records; i++) {
-		const struct drm_i915_perf_record_header *current_header =
-			reader->records[i];
-		const uint8_t *start_report = (const uint8_t *) (last_header + 1),
-			*end_report = (const uint8_t *) (current_header + 1);
-		uint32_t last_ctx_id = oa_report_ctx_id(&reader->devinfo, start_report),
-			current_ctx_id = oa_report_ctx_id(&reader->devinfo, end_report);
-		uint64_t gpu_ts_start = oa_report_timestamp(start_report),
-			gpu_ts_end = oa_report_timestamp(end_report);
+		current_header = reader->records[i];
+
+		start_report = (const uint8_t *) (last_header + 1);
+		end_report = (const uint8_t *) (current_header + 1);
+
+		last_ctx_id = oa_report_ctx_id(&reader->devinfo, start_report);
+		current_ctx_id = oa_report_ctx_id(&reader->devinfo, end_report);
+
+		gpu_ts_start = intel_perf_read_record_timestamp(reader->perf,
+								reader->metric_set,
+								last_header);
+		gpu_ts_end = intel_perf_read_record_timestamp(reader->perf,
+							      reader->metric_set,
+							      current_header);
 
 		if (last_ctx_id == current_ctx_id)
 			continue;
@@ -317,6 +307,9 @@ generate_cpu_events(struct intel_perf_data_reader *reader)
 		last_header = current_header;
 		last_header_idx = i;
 	}
+
+	if (last_header != current_header)
+		append_timeline_event(reader, gpu_ts_start, gpu_ts_end, last_header_idx, reader->n_records - 1, last_ctx_id);
 }
 
 static void
@@ -344,8 +337,8 @@ bool
 intel_perf_data_reader_init(struct intel_perf_data_reader *reader,
 			    int perf_file_fd)
 {
-        struct stat st;
-        if (fstat(perf_file_fd, &st) != 0) {
+	struct stat st;
+	if (fstat(perf_file_fd, &st) != 0) {
 		snprintf(reader->error_msg, sizeof(reader->error_msg),
 			 "Unable to access file (%s)", strerror(errno));
 		return false;

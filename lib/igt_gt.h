@@ -28,9 +28,10 @@
 #include "igt_dummyload.h"
 #include "igt_core.h"
 
+#include "i915/i915_drm_local.h"
 #include "i915_drm.h"
 
-void igt_require_hang_ring(int fd, int ring);
+void igt_require_hang_ring(int fd, uint32_t ctx, int ring);
 
 typedef struct igt_hang {
 	igt_spin_t *spin;
@@ -45,10 +46,15 @@ void igt_disallow_hang(int fd, igt_hang_t arg);
 #define HANG_POISON 0xc5c5c5c5
 
 igt_hang_t igt_hang_ctx(int fd, uint32_t ctx, int ring, unsigned flags);
+igt_hang_t igt_hang_ctx_with_ahnd(int fd, uint64_t ahnd, uint32_t ctx, int ring,
+				  unsigned flags);
+
 #define HANG_ALLOW_BAN 1
 #define HANG_ALLOW_CAPTURE 2
+#define HANG_WANT_ENGINE_RESET 4
 
 igt_hang_t igt_hang_ring(int fd, int ring);
+igt_hang_t igt_hang_ring_with_ahnd(int fd, int ring, uint64_t ahnd);
 void igt_post_hang_ring(int fd, igt_hang_t arg);
 
 void igt_force_gpu_reset(int fd);
@@ -64,32 +70,6 @@ void igt_clflush_range(void *addr, int size);
 unsigned intel_detect_and_clear_missed_interrupts(int fd);
 
 #define ALL_ENGINES ~0u /* Use in interfaces to iterate all engines */
-
-extern const struct intel_execution_engine {
-	const char *name;
-	const char *full_name;
-	unsigned exec_id;
-	unsigned flags;
-} intel_execution_engines[];
-
-#define eb_ring(e) ((e)->exec_id | (e)->flags)
-
-#define for_if(expr__) if (!(expr__)) {} else
-
-#define for_each_engine(it__, fd__) \
-	for (const struct intel_execution_engine *it__ = intel_execution_engines;\
-	     it__->name; \
-	     it__++) \
-		for_if (gem_has_ring(fd__, eb_ring(it__)))
-
-#define for_each_physical_engine(it__, fd__) \
-	for (const struct intel_execution_engine *it__ = intel_execution_engines;\
-	     it__->name; \
-	     it__++) \
-		for_if (gem_ring_has_physical_engine(fd__, eb_ring(it__)))
-
-bool gem_ring_is_physical_engine(int fd, unsigned int ring);
-bool gem_ring_has_physical_engine(int fd, unsigned int ring);
 
 bool gem_can_store_dword(int fd, unsigned int engine);
 bool gem_class_can_store_dword(int fd, int class);
