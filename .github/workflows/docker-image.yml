@@ -4,6 +4,9 @@ on:
   push:
     branches: [ "prometheus" ]
 
+env:
+  REGISTRY_IMAGE: ghcr.io/xingoxu/intel-gpu-exporter
+
 jobs:
 
   build:
