@@ -42,7 +42,7 @@ RUN apt-get install -y \
     libxmlrpc-core-c3-dev \
     libjson-c-dev \
     libcurl4-openssl-dev \
-    python-docutils \
+    python3-docutils \
     valgrind \
     peg \
     libdrm-intel1
