@@ -6,7 +6,7 @@
 # Querying metrics:
 #  curl http://localhost:8080/metrics
 
-FROM ubuntu:20.04
+FROM ubuntu:jammy
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -62,7 +62,7 @@ COPY . /code
 RUN ["meson", "build", "-D", "buildtype=release"]
 RUN ["ninja", "-C", "build"]
 
-FROM openresty/openresty:focal
+FROM openresty/openresty:jammy
 
 RUN sed -i 's/#user/user/g' /usr/local/openresty/nginx/conf/nginx.conf
 RUN sed -i 's/nobody/root/g' /usr/local/openresty/nginx/conf/nginx.conf
